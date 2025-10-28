@@ -9,4 +9,14 @@ day2
 姿态标定
     labelme（F） 无法体现可见点，不可见点，遮挡点
     COCO Annotator （T）查看自动标定结果，修正标定
-准备几张数据集测试，仅作为功能需求，因为原先coco-pose数据集已经很完善，可以适应大部分场景
+准备几张数据集测试，仅作为功能需求测试，因为原先coco-pose数据集已经很完善，可以适应大部分场景
+
+day3
+COCO Annotator微调
+生成json 转为txt，加入yolov8n-pose继续训练
+无法成功推理图片
+未标定人物框图bbox
+重新加入标定
+
+day4
+修改自动标定标注出人物bbox

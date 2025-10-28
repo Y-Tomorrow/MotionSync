@@ -33,6 +33,8 @@ yolo pose predict model=yolov8l-pose.pt source='./1.mp4' show
 ### 自动标注
 auto_label.py
 
+效果图：
+![alt text](./images/1.png)
 
 ### txt-COCO JSON
 ```bash
@@ -61,3 +63,16 @@ docker-compose down
 ```
 浏览器访问
 http://localhost:5000
+
+修改文件夹所有权
+
+sudo chown -R $USER:$USER datasets
+
+删除数据集目录
+
+1.退出docker 2.删除docker volume rm $(docker volume ls -q) （COCO Annotator 默认会创建一个 MongoDB 的持久化卷）
+
+追加训练
+```bash
+yolo pose train model=yolov8n-pose.pt data=./datasets/train.yaml epochs=20 imgsz=640
+```
