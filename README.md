@@ -62,15 +62,20 @@ docker-compose up -d
 docker-compose down
 ```
 浏览器访问
+```bash
 http://localhost:5000
+```
+需要在Categories下新建特征点类别，比如person
+
 
 修改文件夹所有权
-
+```bash
 sudo chown -R $USER:$USER datasets
-
+```
 删除数据集目录
 
-1.退出docker 2.删除docker volume rm $(docker volume ls -q) （COCO Annotator 默认会创建一个 MongoDB 的持久化卷）
+1.退出docker \
+2.删除docker volume rm $(docker volume ls -q) （COCO Annotator 默认会创建一个 MongoDB 的持久化卷）
 
 追加训练
 ```bash
