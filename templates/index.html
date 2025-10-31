@@ -1,0 +1,641 @@
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MotionSync - 位姿提取与动作估计软件</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        .content {
+            padding: 20px;
+        }
+        .tab-container {
+            display: flex;
+            border-bottom: 2px solid #eee;
+            margin-bottom: 20px;
+        }
+        .tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.3s;
+        }
+        .tab.active {
+            border-bottom-color: #667eea;
+            color: #667eea;
+            font-weight: bold;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        .btn {
+            background: #667eea;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-right: 10px;
+        }
+        .btn:hover {
+            background: #5a6fd8;
+        }
+        .btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .progress {
+            width: 100%;
+            height: 20px;
+            background: #f0f0f0;
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+        .progress-bar {
+            height: 100%;
+            background: #667eea;
+            transition: width 0.3s;
+        }
+        .log-container {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            padding: 15px;
+            height: 300px;
+            overflow-y: auto;
+            font-family: 'Consolas', monospace;
+            font-size: 12px;
+        }
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .status.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        .dataset-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        .info-card {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+            border-left: 4px solid #667eea;
+        }
+        .info-card h3 {
+            margin: 0 0 10px 0;
+            color: #667eea;
+        }
+        .info-card p {
+            margin: 0;
+            font-size: 24px;
+            font-weight: bold;
+            color: #333;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎯 MotionSync</h1>
+            <p>位姿提取与动作估计软件 - Web版本</p>
+        </div>
+        
+        <div class="content">
+            <div class="tab-container">
+                <div class="tab active" onclick="showTab('auto-label')">位姿提取</div>
+                <div class="tab" onclick="showTab('convert')">格式转换</div>
+                <div class="tab" onclick="showTab('validate')">JSON验证</div>
+                <div class="tab" onclick="showTab('coco')">COCO Annotator</div>
+                <div class="tab" onclick="showTab('dataset')">数据集信息</div>
+                <div class="tab" onclick="showTab('logs')">运行日志</div>
+            </div>
+            
+            <!-- 位姿提取标签页 -->
+            <div id="auto-label" class="tab-content active">
+                <h2>位姿提取</h2>
+                <div class="form-group">
+                    <label>图片目录:</label>
+                    <input type="text" id="img_dir" value="./datasets/images/train">
+                </div>
+                <div class="form-group">
+                    <label>模型路径:</label>
+                    <input type="text" id="model_path" value="./models/yolov8n-pose.pt">
+                </div>
+                <div class="form-group">
+                    <label>输出目录:</label>
+                    <input type="text" id="output_dir" value="./datasets/labels/train">
+                </div>
+                <div class="form-group">
+                    <label>置信度阈值:</label>
+                    <input type="number" id="conf_threshold" value="0.5" min="0.1" max="1.0" step="0.1">
+                </div>
+                <button class="btn" onclick="startAutoLabel()">开始位姿提取</button>
+                <div class="progress" id="progress" style="display: none;">
+                    <div class="progress-bar" id="progress-bar"></div>
+                </div>
+                <div id="status"></div>
+            </div>
+            
+            <!-- 格式转换标签页 -->
+            <div id="convert" class="tab-content">
+                <h2>格式转换</h2>
+                <div class="form-group">
+                    <label>转换类型:</label>
+                    <select id="convert_mode">
+                        <option value="txt2coco">TXT → COCO JSON</option>
+                        <option value="coco2txt">COCO JSON → TXT</option>
+                        <option value="txt2labelme">TXT → LabelMe JSON</option>
+                        <option value="labelme2txt">LabelMe JSON → TXT</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>输入路径:</label>
+                    <input type="text" id="input_path" value="./datasets/labels/train">
+                </div>
+                <div class="form-group">
+                    <label>输出路径:</label>
+                    <input type="text" id="output_path" value="./datasets/labels_json/1.json">
+                </div>
+                <div class="form-group">
+                    <label>图片目录:</label>
+                    <input type="text" id="convert_img_dir" value="./datasets/images/train">
+                </div>
+                <button class="btn" onclick="startConvert()">开始转换</button>
+                <div class="progress" id="convert-progress" style="display: none;">
+                    <div class="progress-bar" id="convert-progress-bar"></div>
+                </div>
+                <div id="convert-status"></div>
+            </div>
+            
+            <!-- JSON验证标签页 -->
+            <div id="validate" class="tab-content">
+                <h2>JSON验证与可视化</h2>
+                <div class="form-group">
+                    <label>JSON文件路径:</label>
+                    <input type="text" id="json_path" placeholder="输入JSON文件路径">
+                </div>
+                <button class="btn" onclick="validateJson()">验证JSON</button>
+                <button class="btn" onclick="visualizeJson()">可视化关键点</button>
+                
+                <div id="validation-result" style="margin-top: 20px;"></div>
+                
+                <div id="visualization-section" style="margin-top: 20px; display: none;">
+                    <h3>关键点可视化</h3>
+                    <div class="form-group">
+                        <label>图片索引:</label>
+                        <input type="number" id="image_index" value="0" min="0">
+                    </div>
+                    <div id="keypoints-display"></div>
+                </div>
+            </div>
+            
+            <!-- COCO Annotator标签页 -->
+            <div id="coco" class="tab-content">
+                <h2>COCO Annotator管理</h2>
+                <div class="info-card">
+                    <h3>COCO Annotator状态</h3>
+                    <p id="coco-status">检查中...</p>
+                </div>
+                
+                <div style="margin: 20px 0;">
+                    <button class="btn" onclick="checkCocoStatus()">检查状态</button>
+                    <button class="btn" onclick="startCocoAnnotator()">启动COCO Annotator</button>
+                    <button class="btn" onclick="stopCocoAnnotator()">停止COCO Annotator</button>
+                    <button class="btn" onclick="openCocoAnnotator()" id="open-coco-btn" style="display: none;">打开COCO Annotator</button>
+                </div>
+                
+                <div id="coco-message" style="margin-top: 20px;"></div>
+                
+                <div class="info-card" style="margin-top: 20px;">
+                    <h3>使用说明</h3>
+                    <p>1. 点击"启动COCO Annotator"启动服务</p>
+                    <p>2. 等待启动完成后，点击"打开COCO Annotator"</p>
+                    <p>3. 在COCO Annotator中验证和修改JSON文件</p>
+                    <p>4. 完成后可以停止服务释放资源</p>
+                </div>
+            </div>
+            
+            <!-- 数据集信息标签页 -->
+            <div id="dataset" class="tab-content">
+                <h2>数据集信息</h2>
+                <button class="btn" onclick="loadDatasetInfo()">刷新信息</button>
+                <div class="dataset-info" id="dataset-info">
+                    <!-- 数据集信息将在这里显示 -->
+                </div>
+            </div>
+            
+            <!-- 运行日志标签页 -->
+            <div id="logs" class="tab-content">
+                <h2>运行日志</h2>
+                <button class="btn" onclick="loadLogs()">刷新日志</button>
+                <button class="btn" onclick="clearLogs()">清空日志</button>
+                <div class="log-container" id="log-container">
+                    <!-- 日志将在这里显示 -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function showTab(tabName) {
+            // 隐藏所有标签页内容
+            const contents = document.querySelectorAll('.tab-content');
+            contents.forEach(content => content.classList.remove('active'));
+            
+            // 移除所有标签的active类
+            const tabs = document.querySelectorAll('.tab');
+            tabs.forEach(tab => tab.classList.remove('active'));
+            
+            // 显示选中的标签页
+            document.getElementById(tabName).classList.add('active');
+            event.target.classList.add('active');
+        }
+        
+        function startAutoLabel() {
+            const data = {
+                img_dir: document.getElementById('img_dir').value,
+                model_path: document.getElementById('model_path').value,
+                output_dir: document.getElementById('output_dir').value,
+                conf_threshold: parseFloat(document.getElementById('conf_threshold').value)
+            };
+            
+            fetch('/api/auto_label', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(data)
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    showStatus('error', data.error);
+                } else {
+                    showStatus('info', data.message);
+                    document.getElementById('progress').style.display = 'block';
+                    pollStatus();
+                }
+            })
+            .catch(error => {
+                showStatus('error', '请求失败: ' + error);
+            });
+        }
+        
+        function startConvert() {
+            const data = {
+                mode: document.getElementById('convert_mode').value,
+                input_path: document.getElementById('input_path').value,
+                output_path: document.getElementById('output_path').value,
+                img_dir: document.getElementById('convert_img_dir').value
+            };
+            
+            fetch('/api/convert', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(data)
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    showConvertStatus('error', data.error);
+                } else {
+                    showConvertStatus('info', data.message);
+                    document.getElementById('convert-progress').style.display = 'block';
+                    pollStatus();
+                }
+            })
+            .catch(error => {
+                showConvertStatus('error', '请求失败: ' + error);
+            });
+        }
+        
+        function pollStatus() {
+            fetch('/api/status')
+            .then(response => response.json())
+            .then(data => {
+                if (data.running) {
+                    document.getElementById('progress-bar').style.width = data.progress + '%';
+                    document.getElementById('convert-progress-bar').style.width = data.progress + '%';
+                    setTimeout(pollStatus, 1000);
+                } else {
+                    document.getElementById('progress').style.display = 'none';
+                    document.getElementById('convert-progress').style.display = 'none';
+                    if (data.message) {
+                        showStatus('success', data.message);
+                        showConvertStatus('success', data.message);
+                    }
+                }
+            });
+        }
+        
+        function showStatus(type, message) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.innerHTML = `<div class="status ${type}">${message}</div>`;
+        }
+        
+        function showConvertStatus(type, message) {
+            const statusDiv = document.getElementById('convert-status');
+            statusDiv.innerHTML = `<div class="status ${type}">${message}</div>`;
+        }
+        
+        function loadDatasetInfo() {
+            fetch('/api/dataset_info')
+            .then(response => response.json())
+            .then(data => {
+                const container = document.getElementById('dataset-info');
+                container.innerHTML = `
+                    <div class="info-card">
+                        <h3>训练图片</h3>
+                        <p>${data.train_images}</p>
+                    </div>
+                    <div class="info-card">
+                        <h3>验证图片</h3>
+                        <p>${data.val_images}</p>
+                    </div>
+                    <div class="info-card">
+                        <h3>训练标签</h3>
+                        <p>${data.train_labels}</p>
+                    </div>
+                    <div class="info-card">
+                        <h3>验证标签</h3>
+                        <p>${data.val_labels}</p>
+                    </div>
+                    <div class="info-card">
+                        <h3>总图片数</h3>
+                        <p>${data.total_images}</p>
+                    </div>
+                    <div class="info-card">
+                        <h3>总标签数</h3>
+                        <p>${data.total_labels}</p>
+                    </div>
+                `;
+            });
+        }
+        
+        function loadLogs() {
+            fetch('/api/logs')
+            .then(response => response.json())
+            .then(data => {
+                const container = document.getElementById('log-container');
+                container.innerHTML = data.logs.map(log => `<div>${log}</div>`).join('');
+                container.scrollTop = container.scrollHeight;
+            });
+        }
+        
+        function clearLogs() {
+            document.getElementById('log-container').innerHTML = '';
+        }
+        
+        function validateJson() {
+            const jsonPath = document.getElementById('json_path').value;
+            if (!jsonPath) {
+                showValidationResult('error', '请输入JSON文件路径');
+                return;
+            }
+            
+            fetch('/api/validate_json', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({json_path: jsonPath})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    showValidationResult('error', data.error);
+                } else {
+                    const status = data.valid ? 'success' : 'error';
+                    const message = data.valid ? 
+                        `JSON文件验证通过！图片: ${data.images_count}, 标注: ${data.annotations_count}, 类别: ${data.categories_count}` :
+                        `JSON文件验证失败: ${data.issues.join(', ')}`;
+                    showValidationResult(status, message);
+                }
+            })
+            .catch(error => {
+                showValidationResult('error', '验证失败: ' + error);
+            });
+        }
+        
+        function visualizeJson() {
+            const jsonPath = document.getElementById('json_path').value;
+            const imageIndex = parseInt(document.getElementById('image_index').value);
+            
+            if (!jsonPath) {
+                showValidationResult('error', '请输入JSON文件路径');
+                return;
+            }
+            
+            fetch('/api/visualize_json', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    json_path: jsonPath,
+                    image_index: imageIndex
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    showValidationResult('error', data.error);
+                } else {
+                    displayKeypoints(data);
+                    document.getElementById('visualization-section').style.display = 'block';
+                }
+            })
+            .catch(error => {
+                showValidationResult('error', '可视化失败: ' + error);
+            });
+        }
+        
+        function showValidationResult(type, message) {
+            const resultDiv = document.getElementById('validation-result');
+            resultDiv.innerHTML = `<div class="status ${type}">${message}</div>`;
+        }
+        
+        function displayKeypoints(data) {
+            const container = document.getElementById('keypoints-display');
+            const imageInfo = data.image_info;
+            const keypoints = data.keypoints;
+            
+            let html = `
+                <div class="info-card">
+                    <h3>图片信息</h3>
+                    <p>文件名: ${imageInfo.file_name}</p>
+                    <p>尺寸: ${imageInfo.width} x ${imageInfo.height}</p>
+                    <p>标注数量: ${data.annotations_count}</p>
+                </div>
+                <div class="info-card">
+                    <h3>关键点信息</h3>
+                    <p>关键点数量: ${keypoints.length}</p>
+                </div>
+            `;
+            
+            if (keypoints.length > 0) {
+                html += '<h4>关键点详情:</h4><div style="max-height: 300px; overflow-y: auto;">';
+                keypoints.forEach((kp, index) => {
+                    const visibility = kp.visibility === 2 ? '可见' : kp.visibility === 1 ? '遮挡' : '不可见';
+                    html += `
+                        <div style="padding: 5px; border-bottom: 1px solid #eee;">
+                            关键点 ${kp.point_id}: (${kp.x.toFixed(2)}, ${kp.y.toFixed(2)}) - ${visibility}
+                        </div>
+                    `;
+                });
+                html += '</div>';
+            }
+            
+            container.innerHTML = html;
+        }
+        
+        function checkCocoStatus() {
+            fetch('/api/coco_annotator_status')
+            .then(response => response.json())
+            .then(data => {
+                const statusElement = document.getElementById('coco-status');
+                const openBtn = document.getElementById('open-coco-btn');
+                
+                if (data.running) {
+                    statusElement.innerHTML = '✅ COCO Annotator正在运行';
+                    statusElement.style.color = 'green';
+                    openBtn.style.display = 'inline-block';
+                } else {
+                    statusElement.innerHTML = '❌ COCO Annotator未运行';
+                    statusElement.style.color = 'red';
+                    openBtn.style.display = 'none';
+                }
+                
+                if (data.error) {
+                    statusElement.innerHTML += `<br>错误: ${data.error}`;
+                }
+            })
+            .catch(error => {
+                document.getElementById('coco-status').innerHTML = '❌ 检查状态失败: ' + error;
+            });
+        }
+        
+        function startCocoAnnotator() {
+            fetch('/api/start_coco_annotator', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                }
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    showCocoMessage('error', data.error);
+                } else {
+                    showCocoMessage('info', data.message);
+                    // 等待几秒后检查状态
+                    setTimeout(() => {
+                        checkCocoStatus();
+                    }, 5000);
+                }
+            })
+            .catch(error => {
+                showCocoMessage('error', '启动失败: ' + error);
+            });
+        }
+        
+        function stopCocoAnnotator() {
+            fetch('/api/stop_coco_annotator', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                }
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    showCocoMessage('error', data.error);
+                } else {
+                    showCocoMessage('success', data.message);
+                    checkCocoStatus();
+                }
+            })
+            .catch(error => {
+                showCocoMessage('error', '停止失败: ' + error);
+            });
+        }
+        
+        function openCocoAnnotator() {
+            window.open('http://localhost:5000', '_blank');
+        }
+        
+        function showCocoMessage(type, message) {
+            const messageDiv = document.getElementById('coco-message');
+            messageDiv.innerHTML = `<div class="status ${type}">${message}</div>`;
+        }
+        
+        // 页面加载时自动加载数据集信息
+        window.onload = function() {
+            loadDatasetInfo();
+            loadLogs();
+            checkCocoStatus();
+        };
+    </script>
+</body>
+</html>
+    

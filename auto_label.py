@@ -15,7 +15,6 @@ def save_yolo_pose_txt_with_bbox(results, save_dir, class_id=0):
         txt_path = os.path.join(save_dir, f"{base}.txt")
 
         with open(txt_path, "w") as f:
-            # 假设 r.boxes.xywhn 和 r.keypoints.xyn 是一一对应的
             for box, keypoints in zip(r.boxes.xywhn, r.keypoints.xyn):
                 line = [class_id]  # 类别ID
                 line.extend(box.tolist())  # bbox [x_c, y_c, w, h]，归一化
@@ -47,7 +46,7 @@ def auto_label_yolo_format(img_dir, model_path="yolov8n-pose.pt", save_dir="./da
 if __name__ == "__main__":
     auto_label_yolo_format(
         "./datasets/images/train",
-        model_path="yolov8n-pose.pt",
+        model_path="./models/yolov8n-pose.pt",
         save_dir="./datasets/labels/train",
         conf_threshold=0.5  # 提高置信度阈值，减少误检
     )

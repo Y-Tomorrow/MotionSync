@@ -20,3 +20,15 @@ COCO Annotator微调
 
 day4
 修改自动标定标注出人物bbox
+测试自动标定，效果较好
+修改后生成新的json，转为txt拓展训练正常
+
+day5
+网页制作 接口导入（AI）
+后端: Flask Web框架
+前端: HTML5 + CSS3 + JavaScript
+通信: RESTful API + AJAX
+异步处理: Python threading
+
+day6
+网页功能测试
