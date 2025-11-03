@@ -11,15 +11,24 @@ import json
 import logging
 import subprocess
 import time
+import queue
+import numpy as np
+import cv2
 from pathlib import Path
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify, send_file, Response, stream_with_context
 import threading
+import base64
 
 # 导入现有功能模块
 from auto_label import auto_label_yolo_format
 from txt_coco_json import txt_to_coco, coco_to_txt
 from txt_json import yolo_pose_txt_to_labelme, labelme_to_yolo_pose
 from train_pose import train_yolov8_pose
+
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
 
 app = Flask(__name__)
 
@@ -29,6 +38,15 @@ task_status = {
     'progress': 0,
     'message': '',
     'logs': []
+}
+
+# 视频关键点流状态
+pose_stream_state = {
+    'running': False,
+    'stop_flag': False,
+    'thread': None,
+    'queue': None,
+    'model': None
 }
 
 def setup_logging():
@@ -392,6 +410,312 @@ def visualize_json():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+def select_best_keypoints(result):
+    """从单帧结果中选择一组关键点（优先置信度最高的目标）。返回归一化坐标列表"""
+    if not hasattr(result, 'keypoints') or result.keypoints is None or len(result.keypoints) == 0:
+        return None
+    kps = result.keypoints.xyn
+    if kps is None or len(kps) == 0:
+        return None
+    
+    best_idx = 0
+    try:
+        if hasattr(result, 'boxes') and result.boxes is not None and hasattr(result.boxes, 'conf'):
+            confs = result.boxes.conf.cpu().numpy().reshape(-1)
+            if len(confs) == len(kps):
+                best_idx = int(np.argmax(confs))
+    except Exception:
+        best_idx = 0
+    
+    arr = kps[best_idx].cpu().numpy() if hasattr(kps, 'cpu') else kps[best_idx]
+    if arr.shape[0] < 17:
+        return None
+    
+    # 转换为列表格式 [{x, y, v}, ...]
+    kp_list = []
+    for i in range(min(17, arr.shape[0])):
+        kp_list.append({
+            'x': float(arr[i, 0]),
+            'y': float(arr[i, 1]),
+            'v': 2  # visibility: 2=可见
+        })
+    return kp_list
+
+@app.route('/api/get_video_first_frame', methods=['POST'])
+def get_video_first_frame():
+    """获取视频第一帧，用于ROI选择"""
+    try:
+        data = request.json or {}
+        video_path = data.get('video_path')
+        
+        if not video_path or not os.path.exists(video_path):
+            return jsonify({'error': '视频文件不存在'}), 400
+        
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return jsonify({'error': '无法打开视频'}), 400
+        
+        ret, frame = cap.read()
+        cap.release()
+        
+        if not ret:
+            return jsonify({'error': '无法读取视频帧'}), 400
+        
+        # 编码为base64
+        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        frame_base64 = base64.b64encode(buffer).decode('utf-8')
+        
+        h, w = frame.shape[:2]
+        return jsonify({
+            'frame': f'data:image/jpeg;base64,{frame_base64}',
+            'width': int(w),
+            'height': int(h)
+        })
+    except Exception as e:
+        logging.exception('获取视频第一帧失败')
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/start_video_pose', methods=['POST'])
+def start_video_pose():
+    """启动视频关键点检测并通过SSE推送结果"""
+    global pose_stream_state
+    
+    if YOLO is None:
+        return jsonify({'error': 'ultralytics未安装，请先安装: pip install ultralytics'}), 500
+    
+    if pose_stream_state['running']:
+        return jsonify({'error': '视频关键点流已在运行中'}), 400
+    
+    try:
+        data = request.json or {}
+        video_path = data.get('video_path')
+        model_path = data.get('model_path', './models/yolov8n-pose.pt')
+        conf_threshold = float(data.get('conf_threshold', 0.5))
+        roi_str = data.get('roi')  # 格式: "x,y,w,h" 或 None
+        
+        if not video_path or not os.path.exists(video_path):
+            return jsonify({'error': '视频文件不存在'}), 400
+        if not os.path.exists(model_path):
+            return jsonify({'error': '模型文件不存在'}), 400
+        
+        # 解析ROI
+        roi = None
+        if roi_str:
+            try:
+                parts = roi_str.split(',')
+                if len(parts) == 4:
+                    roi = tuple(int(p.strip()) for p in parts)
+            except Exception as e:
+                logging.warning(f'解析ROI失败: {e}，将使用全画面')
+        
+        q = queue.Queue(maxsize=32)
+        pose_stream_state['queue'] = q
+        pose_stream_state['stop_flag'] = False
+        
+        def worker():
+            cap = None
+            try:
+                logging.info('加载YOLO姿态模型中...')
+                model = YOLO(model_path)
+                pose_stream_state['model'] = model
+                logging.info('模型加载完成，开始读取视频')
+                
+                cap = cv2.VideoCapture(video_path)
+                if not cap.isOpened():
+                    q.put({'type': 'error', 'message': '无法打开视频'})
+                    return
+                
+                fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                q.put({'type': 'meta', 'fps': fps, 'width': width, 'height': height})
+                
+                center_ema = np.array([0.5, 0.5], dtype=np.float64)
+                alpha = 0.2
+                frame_idx = 0
+                
+                while not pose_stream_state['stop_flag']:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    h_full, w_full = frame.shape[:2]
+                    frame_idx += 1
+                    
+                    # 在ROI区域内推理
+                    if roi is not None:
+                        x, y, w_roi, h_roi = roi
+                        if x >= 0 and y >= 0 and x + w_roi <= w_full and y + h_roi <= h_full:
+                            roi_frame = frame[y:y+h_roi, x:x+w_roi]
+                            if roi_frame.size > 0:
+                                results = model(roi_frame, conf=conf_threshold)
+                            else:
+                                results = []
+                        else:
+                            results = []
+                    else:
+                        results = model(frame, conf=conf_threshold)
+                    
+                    # 提取关键点
+                    best_kp = None
+                    for r in results:
+                        kp_local = select_best_keypoints(r)
+                        if kp_local is not None:
+                            # 如果使用了ROI，转换坐标
+                            if roi is not None:
+                                x, y, w_roi, h_roi = roi
+                                for kp in kp_local:
+                                    kp['x'] = (kp['x'] * w_roi + x) / w_full
+                                    kp['y'] = (kp['y'] * h_roi + y) / h_full
+                            best_kp = kp_local
+                            break
+                    
+                    # EMA平滑中心（用于居中）
+                    if best_kp:
+                        kp_arr = np.array([[p['x'], p['y']] for p in best_kp])
+                        x_min = float(kp_arr[:, 0].min())
+                        x_max = float(kp_arr[:, 0].max())
+                        y_min = float(kp_arr[:, 1].min())
+                        y_max = float(kp_arr[:, 1].max())
+                        bbox_center = np.array([(x_min + x_max) / 2.0, (y_min + y_max) / 2.0])
+                        center_ema = (1.0 - alpha) * center_ema + alpha * bbox_center
+                    
+                    # 每隔3帧发送一次视频帧，降低负载（或每帧发送但降低质量）
+                    frame_base64 = None
+                    if frame_idx % 3 == 0:  # 每隔3帧发送一次
+                        # 在帧上绘制关键点和ROI框
+                        display_frame = frame.copy()
+                        if roi is not None:
+                            x_roi, y_roi, w_roi, h_roi = roi
+                            cv2.rectangle(display_frame, (x_roi, y_roi), (x_roi + w_roi, y_roi + h_roi), (255, 0, 0), 2)
+                        
+                        if best_kp:
+                            h, w = display_frame.shape[:2]
+                            pts_px = []
+                            for p in best_kp:
+                                pts_px.append((int(p['x'] * w), int(p['y'] * h)))
+                            
+                            # 画点和线
+                            for (x, y) in pts_px:
+                                cv2.circle(display_frame, (x, y), 3, (0, 255, 255), -1)
+                            
+                            COCO_EDGES = [
+                                [0, 1], [0, 2], [1, 3], [2, 4], [0, 5], [0, 6],
+                                [5, 7], [7, 9], [6, 8], [8, 10],
+                                [11, 13], [13, 15], [12, 14], [14, 16],
+                                [5, 6], [11, 12], [5, 11], [6, 12]
+                            ]
+                            for e in COCO_EDGES:
+                                if e[0] < len(pts_px) and e[1] < len(pts_px):
+                                    cv2.line(display_frame, pts_px[e[0]], pts_px[e[1]], (0, 200, 255), 2)
+                        
+                        # 压缩编码
+                        _, buffer = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                        frame_base64 = base64.b64encode(buffer).decode('utf-8')
+                    
+                    payload = {
+                        'type': 'keypoints',
+                        'people': [best_kp] if best_kp else [],
+                        'center': [float(center_ema[0]), float(center_ema[1])],
+                        'frame': frame_base64,  # 可能为None
+                        'ts': time.time()
+                    }
+                    
+                    try:
+                        q.put(payload, timeout=0.5)
+                    except queue.Full:
+                        # 丢弃旧帧，保持实时
+                        try:
+                            _ = q.get_nowait()
+                        except Exception:
+                            pass
+                        try:
+                            q.put(payload, timeout=0.1)
+                        except Exception:
+                            pass
+                    
+            except Exception as e:
+                logging.exception('视频关键点工作线程异常')
+                try:
+                    q.put({'type': 'error', 'message': str(e)})
+                except Exception:
+                    pass
+            finally:
+                if cap is not None:
+                    cap.release()
+                pose_stream_state['running'] = False
+                pose_stream_state['model'] = None
+                try:
+                    q.put({'type': 'eof'})
+                except Exception:
+                    pass
+        
+        t = threading.Thread(target=worker, daemon=True)
+        pose_stream_state['thread'] = t
+        pose_stream_state['running'] = True
+        t.start()
+        return jsonify({'message': '视频关键点流已启动'})
+        
+    except Exception as e:
+        pose_stream_state['running'] = False
+        pose_stream_state['stop_flag'] = False
+        pose_stream_state['thread'] = None
+        pose_stream_state['queue'] = None
+        logging.exception('启动视频关键点流失败')
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/stop_video_pose', methods=['POST'])
+def stop_video_pose():
+    """停止视频关键点流"""
+    global pose_stream_state
+    if not pose_stream_state['running']:
+        return jsonify({'message': '未在运行'})
+    pose_stream_state['stop_flag'] = True
+    return jsonify({'message': '停止指令已发送'})
+
+@app.route('/api/pose_stream')
+def pose_stream():
+    """SSE推送关键点: text/event-stream，每条为JSON"""
+    global pose_stream_state
+    q = pose_stream_state.get('queue')
+    if q is None:
+        return jsonify({'error': '流未启动'}), 400
+    
+    @stream_with_context
+    def event_source():
+        last_heartbeat = time.time()
+        while True:
+            # 心跳，防止中间件/浏览器超时断开
+            now = time.time()
+            if now - last_heartbeat >= 10:
+                yield ': heartbeat\n\n'
+                last_heartbeat = now
+            
+            try:
+                item = q.get(timeout=0.5)
+            except queue.Empty:
+                if not pose_stream_state['running']:
+                    yield 'event: end\ndata: {}\n\n'
+                    break
+                continue
+            
+            if item is None:
+                continue
+            
+            if item.get('type') == 'eof':
+                yield 'event: end\ndata: {}\n\n'
+                break
+            
+            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+    
+    headers = {
+        'Cache-Control': 'no-cache',
+        'Content-Type': 'text/event-stream',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
+    }
+    return Response(event_source(), headers=headers, mimetype='text/event-stream')
+
 if __name__ == '__main__':
     setup_logging()
     
@@ -568,6 +892,7 @@ if __name__ == '__main__':
                 <div class="tab" onclick="showTab('coco')">COCO Annotator</div>
                 <div class="tab" onclick="showTab('dataset')">数据集信息</div>
                 <div class="tab" onclick="showTab('logs')">运行日志</div>
+                <div class="tab" onclick="showTab('pose3d')">3D火柴人</div>
             </div>
             
             <!-- 位姿提取标签页 -->
@@ -693,9 +1018,66 @@ if __name__ == '__main__':
                     <!-- 日志将在这里显示 -->
                 </div>
             </div>
+            
+            <!-- 3D火柴人标签页 -->
+            <div id="pose3d" class="tab-content">
+                <h2>3D火柴人（实时）</h2>
+                <div class="form-group">
+                    <label>视频路径:</label>
+                    <input type="text" id="video_path" placeholder="例如: ./datasets/videos/demo.mp4 或 ./1.mp4">
+                    <button class="btn" onclick="loadVideoFrame()" style="margin-top: 5px;">加载第一帧并选择ROI</button>
+                </div>
+                <div class="form-group">
+                    <label>ROI区域:</label>
+                    <input type="text" id="pose_roi" placeholder="将在第一帧上选择，或手动输入 x,y,w,h">
+                    <div id="roi_canvas_container" style="margin-top: 10px; display: none;">
+                        <canvas id="roi_canvas" style="border: 1px solid #ddd; max-width: 100%; cursor: crosshair;"></canvas>
+                        <div style="margin-top: 5px;">
+                            <button class="btn" onclick="confirmROI()">确认ROI</button>
+                            <button class="btn" onclick="cancelROISelection()">取消</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>模型路径:</label>
+                    <input type="text" id="pose_model_path" value="./models/yolov8n-pose.pt">
+                </div>
+                <div class="form-group">
+                    <label>置信度阈值:</label>
+                    <input type="number" id="pose_conf" value="0.5" min="0.1" max="1.0" step="0.1">
+                </div>
+                <div class="form-group">
+                    <label>缩放比例:</label>
+                    <input type="number" id="pose_scale" value="1.0" min="0.1" max="3.0" step="0.1">
+                </div>
+                <button class="btn" onclick="startPoseStream()">开始</button>
+                <button class="btn" onclick="stopPoseStream()">停止</button>
+
+                <div id="pose_status" style="margin-top: 10px;"></div>
+                
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 15px;">
+                    <div>
+                        <h3>视频流</h3>
+                        <img id="video_frame" style="width: 100%; background: #111; border-radius: 8px; display: none;">
+                        <div id="video_placeholder" style="width: 100%; height: 360px; background: #111; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #666;">
+                            等待视频流...
+                        </div>
+                    </div>
+                    <div>
+                        <h3>3D火柴人</h3>
+                        <div id="three-container" style="width: 100%; height: 360px; background: #111; border-radius: 8px;"></div>
+                    </div>
+                </div>
+                
+                <div style="margin-top: 10px; color:#666;">
+                    提示：点击"加载第一帧并选择ROI"可在视频第一帧上拖拽选择感兴趣区域。3D火柴人实时显示关键点，可拖拽旋转查看不同角度。
+                </div>
+            </div>
         </div>
     </div>
 
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
     <script>
         function showTab(tabName) {
             // 隐藏所有标签页内容
@@ -1029,6 +1411,307 @@ if __name__ == '__main__':
         function showCocoMessage(type, message) {
             const messageDiv = document.getElementById('coco-message');
             messageDiv.innerHTML = `<div class="status ${type}">${message}</div>`;
+        }
+        
+        // ========== 3D 火柴人渲染 ==========
+        // 说明：Web版本并没有直接调用test_pose3d.py的函数，而是重新实现了类似的功能
+        // 对应关系：
+        // - select_best_keypoints() -> web版本中的select_best_keypoints()（后端）
+        // - map_2d_to_3d_centered() -> 前端updateSkeletonFromKeypoints()中使用center和scale参数实现
+        // - ROI选择逻辑 -> 通过Canvas在前端实现，类似test_pose3d.py中的cv2.selectROI()
+        
+        let threeRenderer, threeScene, threeCamera, threeControls;
+        let skeletonLine;
+        let poseEventSource = null;
+        let roiSelecting = false;
+        let roiStartX = 0, roiStartY = 0, roiCurrentX = 0, roiCurrentY = 0;
+        let roiCanvas = null, roiCtx = null, roiImage = null;
+        const COCO_EDGES = [
+            [0, 1], [0, 2], [1, 3], [2, 4], [0, 5], [0, 6],
+            [5, 7], [7, 9],
+            [6, 8], [8, 10],
+            [11, 13], [13, 15],
+            [12, 14], [14, 16],
+            [5, 6],
+            [11, 12],
+            [5, 11], [6, 12]
+        ];
+
+        function ensureThree() {
+            if (threeRenderer) return;
+            const container = document.getElementById('three-container');
+            const w = container.clientWidth;
+            const h = container.clientHeight;
+
+            threeRenderer = new THREE.WebGLRenderer({ antialias: true });
+            threeRenderer.setSize(w, h);
+            threeRenderer.setPixelRatio(window.devicePixelRatio);
+            container.innerHTML = '';
+            container.appendChild(threeRenderer.domElement);
+
+            threeScene = new THREE.Scene();
+            threeScene.background = new THREE.Color(0x111111);
+
+            threeCamera = new THREE.PerspectiveCamera(45, w / h, 0.01, 100);
+            threeCamera.position.set(0, 0, 2.2);
+
+            threeControls = new THREE.OrbitControls(threeCamera, threeRenderer.domElement);
+            threeControls.enableDamping = true;
+
+            const light = new THREE.DirectionalLight(0xffffff, 0.8);
+            light.position.set(1, 1, 2);
+            threeScene.add(light);
+            threeScene.add(new THREE.AmbientLight(0xffffff, 0.3));
+
+            const material = new THREE.LineBasicMaterial({ color: 0x44ccff, linewidth: 2 });
+            const geometry = new THREE.BufferGeometry();
+            const maxSegments = COCO_EDGES.length;
+            const positions = new Float32Array(maxSegments * 2 * 3);
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            skeletonLine = new THREE.LineSegments(geometry, material);
+            threeScene.add(skeletonLine);
+
+            const coord = new THREE.AxesHelper(0.3);
+            threeScene.add(coord);
+
+            window.addEventListener('resize', () => {
+                const w2 = container.clientWidth;
+                const h2 = container.clientHeight;
+                threeCamera.aspect = w2 / h2;
+                threeCamera.updateProjectionMatrix();
+                threeRenderer.setSize(w2, h2);
+            });
+
+            function animate() {
+                requestAnimationFrame(animate);
+                threeControls.update();
+                threeRenderer.render(threeScene, threeCamera);
+            }
+            animate();
+        }
+
+        function updateSkeletonFromKeypoints(people, center, scale) {
+            if (!skeletonLine) return;
+            const pos = skeletonLine.geometry.attributes.position.array;
+            const kp = (people && people.length > 0) ? people[0] : null;
+            let idx = 0;
+            
+            if (kp && kp.length >= 17) {
+                const s = scale || 1.0;
+                const cx = center && center.length >= 2 ? center[0] : 0.5;
+                const cy = center && center.length >= 2 ? center[1] : 0.5;
+                
+                function mapPt(p) {
+                    const x = (p.x - cx) * s;
+                    const y = -(p.y - cy) * s;
+                    const z = 0.0;
+                    return [x, y, z];
+                }
+                
+                COCO_EDGES.forEach(edge => {
+                    if (edge[0] < kp.length && edge[1] < kp.length) {
+                        const a = mapPt(kp[edge[0]]);
+                        const b = mapPt(kp[edge[1]]);
+                        pos[idx++] = a[0]; pos[idx++] = a[1]; pos[idx++] = a[2];
+                        pos[idx++] = b[0]; pos[idx++] = b[1]; pos[idx++] = b[2];
+                    }
+                });
+            } else {
+                for (let i = 0; i < pos.length; i++) pos[i] = 0;
+            }
+            skeletonLine.geometry.attributes.position.needsUpdate = true;
+        }
+
+        function startPoseStream() {
+            ensureThree();
+            const videoPath = document.getElementById('video_path').value;
+            const modelPath = document.getElementById('pose_model_path').value;
+            const conf = parseFloat(document.getElementById('pose_conf').value || '0.5');
+            const roi = document.getElementById('pose_roi').value.trim() || null;
+            
+            if (!videoPath) {
+                setPoseStatus('error', '请填写视频路径');
+                return;
+            }
+            
+            const data = {
+                video_path: videoPath,
+                model_path: modelPath,
+                conf_threshold: conf
+            };
+            if (roi) {
+                data.roi = roi;
+            }
+            
+            fetch('/api/start_video_pose', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            }).then(r => r.json()).then(res => {
+                if (res.error) {
+                    setPoseStatus('error', res.error);
+                    return;
+                }
+                setPoseStatus('info', '视频关键点流已启动');
+                
+                if (poseEventSource) {
+                    poseEventSource.close();
+                }
+                
+                poseEventSource = new EventSource('/api/pose_stream');
+                poseEventSource.onmessage = (ev) => {
+                    try {
+                        const data = JSON.parse(ev.data);
+                        if (data.type === 'keypoints') {
+                            const scale = parseFloat(document.getElementById('pose_scale').value || '1.0');
+                            updateSkeletonFromKeypoints(data.people, data.center, scale);
+                            
+                            // 显示视频帧
+                            if (data.frame) {
+                                const imgEl = document.getElementById('video_frame');
+                                const placeholder = document.getElementById('video_placeholder');
+                                imgEl.src = 'data:image/jpeg;base64,' + data.frame;
+                                imgEl.style.display = 'block';
+                                if (placeholder) placeholder.style.display = 'none';
+                            }
+                        } else if (data.type === 'error') {
+                            setPoseStatus('error', data.message);
+                        }
+                    } catch (e) {
+                        console.error('解析关键点数据失败:', e);
+                    }
+                };
+                
+                poseEventSource.addEventListener('end', () => {
+                    setPoseStatus('success', '视频已结束');
+                    if (poseEventSource) {
+                        poseEventSource.close();
+                        poseEventSource = null;
+                    }
+                });
+                
+                poseEventSource.onerror = () => {
+                    setPoseStatus('error', 'SSE连接错误');
+                };
+            }).catch(err => setPoseStatus('error', '启动失败: ' + err));
+        }
+
+        function stopPoseStream() {
+            if (poseEventSource) {
+                poseEventSource.close();
+                poseEventSource = null;
+            }
+            fetch('/api/stop_video_pose', { method: 'POST', headers: { 'Content-Type': 'application/json' }})
+                .then(r => r.json())
+                .then(res => setPoseStatus('info', res.message || '已停止'))
+                .catch(() => setPoseStatus('error', '停止失败'));
+        }
+
+        function setPoseStatus(type, msg) {
+            const el = document.getElementById('pose_status');
+            el.innerHTML = `<div class="status ${type}">${msg}</div>`;
+        }
+
+        // ROI选择功能
+        function loadVideoFrame() {
+            const videoPath = document.getElementById('video_path').value;
+            if (!videoPath) {
+                setPoseStatus('error', '请先填写视频路径');
+                return;
+            }
+            
+            fetch('/api/get_video_first_frame', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ video_path: videoPath })
+            }).then(r => r.json()).then(res => {
+                if (res.error) {
+                    setPoseStatus('error', res.error);
+                    return;
+                }
+                
+                roiCanvas = document.getElementById('roi_canvas');
+                roiCtx = roiCanvas.getContext('2d');
+                
+                const img = new Image();
+                img.onload = function() {
+                    const maxWidth = 800;
+                    const scale = Math.min(1, maxWidth / img.width);
+                    roiCanvas.width = img.width * scale;
+                    roiCanvas.height = img.height * scale;
+                    
+                    roiCtx.drawImage(img, 0, 0, roiCanvas.width, roiCanvas.height);
+                    roiImage = { img: img, scale: scale, origWidth: img.width, origHeight: img.height };
+                    
+                    document.getElementById('roi_canvas_container').style.display = 'block';
+                    setPoseStatus('info', '请在第一帧上拖拽选择ROI区域');
+                };
+                img.src = res.frame;
+            }).catch(err => setPoseStatus('error', '加载失败: ' + err));
+        }
+
+        // Canvas ROI选择事件
+        document.addEventListener('DOMContentLoaded', function() {
+            const canvas = document.getElementById('roi_canvas');
+            if (!canvas) return;
+            
+            canvas.addEventListener('mousedown', function(e) {
+                if (!roiImage) return;
+                roiSelecting = true;
+                const rect = canvas.getBoundingClientRect();
+                roiStartX = e.clientX - rect.left;
+                roiStartY = e.clientY - rect.top;
+            });
+            
+            canvas.addEventListener('mousemove', function(e) {
+                if (!roiSelecting || !roiImage) return;
+                const rect = canvas.getBoundingClientRect();
+                roiCurrentX = e.clientX - rect.left;
+                roiCurrentY = e.clientY - rect.top;
+                
+                roiCtx.clearRect(0, 0, canvas.width, canvas.height);
+                roiCtx.drawImage(roiImage.img, 0, 0, canvas.width, canvas.height);
+                
+                const w = roiCurrentX - roiStartX;
+                const h = roiCurrentY - roiStartY;
+                roiCtx.strokeStyle = 'red';
+                roiCtx.lineWidth = 2;
+                roiCtx.strokeRect(roiStartX, roiStartY, w, h);
+            });
+            
+            canvas.addEventListener('mouseup', function(e) {
+                if (!roiSelecting || !roiImage) return;
+                roiSelecting = false;
+            });
+        });
+
+        function confirmROI() {
+            if (!roiImage) return;
+            
+            const x = Math.min(roiStartX, roiCurrentX);
+            const y = Math.min(roiStartY, roiCurrentY);
+            const w = Math.abs(roiCurrentX - roiStartX);
+            const h = Math.abs(roiCurrentY - roiStartY);
+            
+            if (w < 10 || h < 10) {
+                setPoseStatus('error', 'ROI区域太小，请重新选择');
+                return;
+            }
+            
+            // 转换为原始图片坐标
+            const origX = Math.floor(x / roiImage.scale);
+            const origY = Math.floor(y / roiImage.scale);
+            const origW = Math.floor(w / roiImage.scale);
+            const origH = Math.floor(h / roiImage.scale);
+            
+            document.getElementById('pose_roi').value = `${origX},${origY},${origW},${origH}`;
+            document.getElementById('roi_canvas_container').style.display = 'none';
+            setPoseStatus('success', `ROI已设置: ${origX},${origY},${origW},${origH}`);
+        }
+
+        function cancelROISelection() {
+            document.getElementById('roi_canvas_container').style.display = 'none';
+            roiImage = null;
         }
         
         // 页面加载时自动加载数据集信息
