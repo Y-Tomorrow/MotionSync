@@ -492,6 +492,7 @@ def start_video_pose():
         model_path = data.get('model_path', './models/yolov8n-pose.pt')
         conf_threshold = float(data.get('conf_threshold', 0.5))
         roi_str = data.get('roi')  # 格式: "x,y,w,h" 或 None
+        playback_speed = float(data.get('playback_speed', 1.0))  # 播放速度倍数，1.0=正常速度
         
         if not video_path or not os.path.exists(video_path):
             return jsonify({'error': '视频文件不存在'}), 400
@@ -530,11 +531,16 @@ def start_video_pose():
                 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 q.put({'type': 'meta', 'fps': fps, 'width': width, 'height': height})
                 
+                # 计算每帧间隔时间（秒），考虑播放速度
+                base_interval = 1.0 / fps if fps > 0 else 0.04  # 默认25fps
+                frame_interval = base_interval / playback_speed  # 速度越快，间隔越短
+                
                 center_ema = np.array([0.5, 0.5], dtype=np.float64)
                 alpha = 0.2
                 frame_idx = 0
                 
                 while not pose_stream_state['stop_flag']:
+                    frame_start_time = time.time()
                     ret, frame = cap.read()
                     if not ret:
                         break
@@ -580,44 +586,58 @@ def start_video_pose():
                         bbox_center = np.array([(x_min + x_max) / 2.0, (y_min + y_max) / 2.0])
                         center_ema = (1.0 - alpha) * center_ema + alpha * bbox_center
                     
-                    # 每隔3帧发送一次视频帧，降低负载（或每帧发送但降低质量）
+                    # 每帧都发送视频帧，通过降低质量和适度缩放来平衡性能
                     frame_base64 = None
-                    if frame_idx % 3 == 0:  # 每隔3帧发送一次
-                        # 在帧上绘制关键点和ROI框
-                        display_frame = frame.copy()
-                        if roi is not None:
-                            x_roi, y_roi, w_roi, h_roi = roi
-                            cv2.rectangle(display_frame, (x_roi, y_roi), (x_roi + w_roi, y_roi + h_roi), (255, 0, 0), 2)
+                    # 在帧上绘制关键点和ROI框
+                    display_frame = frame.copy()
+                    
+                    # 如果帧太大，先缩小以提升编码速度
+                    max_display_width = 960
+                    scale_factor = 1.0
+                    if w_full > max_display_width:
+                        scale_factor = max_display_width / w_full
+                        new_w = int(w_full * scale_factor)
+                        new_h = int(h_full * scale_factor)
+                        display_frame = cv2.resize(display_frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                    
+                    if roi is not None:
+                        x_roi, y_roi, w_roi, h_roi = roi
+                        x_roi_scaled = int(x_roi * scale_factor)
+                        y_roi_scaled = int(y_roi * scale_factor)
+                        w_roi_scaled = int(w_roi * scale_factor)
+                        h_roi_scaled = int(h_roi * scale_factor)
+                        cv2.rectangle(display_frame, (x_roi_scaled, y_roi_scaled), 
+                                     (x_roi_scaled + w_roi_scaled, y_roi_scaled + h_roi_scaled), (255, 0, 0), 2)
+                    
+                    if best_kp:
+                        h, w = display_frame.shape[:2]
+                        pts_px = []
+                        for p in best_kp:
+                            pts_px.append((int(p['x'] * w), int(p['y'] * h)))
                         
-                        if best_kp:
-                            h, w = display_frame.shape[:2]
-                            pts_px = []
-                            for p in best_kp:
-                                pts_px.append((int(p['x'] * w), int(p['y'] * h)))
-                            
-                            # 画点和线
-                            for (x, y) in pts_px:
-                                cv2.circle(display_frame, (x, y), 3, (0, 255, 255), -1)
-                            
-                            COCO_EDGES = [
-                                [0, 1], [0, 2], [1, 3], [2, 4], [0, 5], [0, 6],
-                                [5, 7], [7, 9], [6, 8], [8, 10],
-                                [11, 13], [13, 15], [12, 14], [14, 16],
-                                [5, 6], [11, 12], [5, 11], [6, 12]
-                            ]
-                            for e in COCO_EDGES:
-                                if e[0] < len(pts_px) and e[1] < len(pts_px):
-                                    cv2.line(display_frame, pts_px[e[0]], pts_px[e[1]], (0, 200, 255), 2)
+                        # 画点和线
+                        for (x, y) in pts_px:
+                            cv2.circle(display_frame, (x, y), 3, (0, 255, 255), -1)
                         
-                        # 压缩编码
-                        _, buffer = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                        frame_base64 = base64.b64encode(buffer).decode('utf-8')
+                        COCO_EDGES = [
+                            [0, 1], [0, 2], [1, 3], [2, 4], [0, 5], [0, 6],
+                            [5, 7], [7, 9], [6, 8], [8, 10],
+                            [11, 13], [13, 15], [12, 14], [14, 16],
+                            [5, 6], [11, 12], [5, 11], [6, 12]
+                        ]
+                        for e in COCO_EDGES:
+                            if e[0] < len(pts_px) and e[1] < len(pts_px):
+                                cv2.line(display_frame, pts_px[e[0]], pts_px[e[1]], (0, 200, 255), 2)
+                    
+                    # 压缩编码：降低质量以平衡性能和流畅度（60-75质量是好的平衡点）
+                    _, buffer = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                    frame_base64 = base64.b64encode(buffer).decode('utf-8')
                     
                     payload = {
                         'type': 'keypoints',
                         'people': [best_kp] if best_kp else [],
                         'center': [float(center_ema[0]), float(center_ema[1])],
-                        'frame': frame_base64,  # 可能为None
+                        'frame': frame_base64,  # 每帧都包含视频帧数据
                         'ts': time.time()
                     }
                     
@@ -633,6 +653,15 @@ def start_video_pose():
                             q.put(payload, timeout=0.1)
                         except Exception:
                             pass
+                    
+                    # 帧率控制：确保按照视频原始FPS播放
+                    frame_end_time = time.time()
+                    elapsed = frame_end_time - frame_start_time
+                    sleep_time = frame_interval - elapsed
+                    
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)  # 等待剩余时间
+                    # 如果处理时间超过帧间隔，立即处理下一帧（保持实时性）
                     
             except Exception as e:
                 logging.exception('视频关键点工作线程异常')
@@ -1049,6 +1078,11 @@ if __name__ == '__main__':
                 <div class="form-group">
                     <label>缩放比例:</label>
                     <input type="number" id="pose_scale" value="1.0" min="0.1" max="3.0" step="0.1">
+                </div>
+                <div class="form-group">
+                    <label>播放速度:</label>
+                    <input type="number" id="pose_speed" value="1.0" min="0.1" max="5.0" step="0.1">
+                    <small style="color: #666;">1.0=正常速度，2.0=2倍速，0.5=0.5倍速</small>
                 </div>
                 <button class="btn" onclick="startPoseStream()">开始</button>
                 <button class="btn" onclick="stopPoseStream()">停止</button>
@@ -1534,10 +1568,12 @@ if __name__ == '__main__':
                 return;
             }
             
+            const speed = parseFloat(document.getElementById('pose_speed').value || '1.0');
             const data = {
                 video_path: videoPath,
                 model_path: modelPath,
-                conf_threshold: conf
+                conf_threshold: conf,
+                playback_speed: speed
             };
             if (roi) {
                 data.roi = roi;
@@ -1566,11 +1602,18 @@ if __name__ == '__main__':
                             const scale = parseFloat(document.getElementById('pose_scale').value || '1.0');
                             updateSkeletonFromKeypoints(data.people, data.center, scale);
                             
-                            // 显示视频帧
+                            // 显示视频帧（使用Image对象预加载以提升流畅度）
                             if (data.frame) {
                                 const imgEl = document.getElementById('video_frame');
                                 const placeholder = document.getElementById('video_placeholder');
-                                imgEl.src = 'data:image/jpeg;base64,' + data.frame;
+                                
+                                // 使用Image对象预加载，避免阻塞
+                                const img = new Image();
+                                img.onload = function() {
+                                    imgEl.src = this.src;
+                                };
+                                img.src = 'data:image/jpeg;base64,' + data.frame;
+                                
                                 imgEl.style.display = 'block';
                                 if (placeholder) placeholder.style.display = 'none';
                             }

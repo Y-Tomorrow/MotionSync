@@ -324,6 +324,11 @@
                     <label>缩放比例:</label>
                     <input type="number" id="pose_scale" value="1.0" min="0.1" max="3.0" step="0.1">
                 </div>
+                <div class="form-group">
+                    <label>播放速度:</label>
+                    <input type="number" id="pose_speed" value="1.0" min="0.1" max="5.0" step="0.1">
+                    <small style="color: #666;">1.0=正常速度，2.0=2倍速，0.5=0.5倍速</small>
+                </div>
                 <button class="btn" onclick="startPoseStream()">开始</button>
                 <button class="btn" onclick="stopPoseStream()">停止</button>
 
@@ -808,10 +813,12 @@
                 return;
             }
             
+            const speed = parseFloat(document.getElementById('pose_speed').value || '1.0');
             const data = {
                 video_path: videoPath,
                 model_path: modelPath,
-                conf_threshold: conf
+                conf_threshold: conf,
+                playback_speed: speed
             };
             if (roi) {
                 data.roi = roi;
@@ -840,11 +847,18 @@
                             const scale = parseFloat(document.getElementById('pose_scale').value || '1.0');
                             updateSkeletonFromKeypoints(data.people, data.center, scale);
                             
-                            // 显示视频帧
+                            // 显示视频帧（使用Image对象预加载以提升流畅度）
                             if (data.frame) {
                                 const imgEl = document.getElementById('video_frame');
                                 const placeholder = document.getElementById('video_placeholder');
-                                imgEl.src = 'data:image/jpeg;base64,' + data.frame;
+                                
+                                // 使用Image对象预加载，避免阻塞
+                                const img = new Image();
+                                img.onload = function() {
+                                    imgEl.src = this.src;
+                                };
+                                img.src = 'data:image/jpeg;base64,' + data.frame;
+                                
                                 imgEl.style.display = 'block';
                                 if (placeholder) placeholder.style.display = 'none';
                             }
