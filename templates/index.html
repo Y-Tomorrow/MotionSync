@@ -33,17 +33,32 @@
             display: flex;
             border-bottom: 2px solid #eee;
             margin-bottom: 20px;
+            flex-wrap: wrap;
+            gap: 5px;
         }
         .tab {
-            padding: 10px 20px;
+            padding: 8px 16px;
             cursor: pointer;
             border-bottom: 2px solid transparent;
             transition: all 0.3s;
+            font-size: 13px;
+            white-space: nowrap;
         }
         .tab.active {
             border-bottom-color: #667eea;
             color: #667eea;
             font-weight: bold;
+        }
+        .tab-group {
+            display: flex;
+            gap: 0;
+            border-right: 1px solid #ddd;
+            padding-right: 10px;
+            margin-right: 10px;
+        }
+        .tab-group:last-child {
+            border-right: none;
+            margin-right: 0;
         }
         .tab-content {
             display: none;
@@ -160,13 +175,24 @@
         
         <div class="content">
             <div class="tab-container">
-                <div class="tab active" onclick="showTab('auto-label')">位姿提取</div>
-                <div class="tab" onclick="showTab('convert')">格式转换</div>
-                <div class="tab" onclick="showTab('validate')">JSON验证</div>
-                <div class="tab" onclick="showTab('coco')">COCO Annotator</div>
-                <div class="tab" onclick="showTab('dataset')">数据集信息</div>
-                <div class="tab" onclick="showTab('logs')">运行日志</div>
-                <div class="tab" onclick="showTab('pose3d')">3D火柴人</div>
+                <div class="tab-group">
+                    <div class="tab active" onclick="showTab('auto-label')">位姿提取</div>
+                    <div class="tab" onclick="showTab('convert')">格式转换</div>
+                    <div class="tab" onclick="showTab('validate')">JSON验证</div>
+                    <div class="tab" onclick="showTab('dataset')">数据集信息</div>
+                </div>
+                <div class="tab-group">
+                    <div class="tab" onclick="showTab('video_action')">视频标注</div>
+                    <div class="tab" onclick="showTab('realtime_action')">实时标注</div>
+                </div>
+                <div class="tab-group">
+                    <div class="tab" onclick="showTab('action_training')">模型训练</div>
+                    <div class="tab" onclick="showTab('pose3d')">动作识别</div>
+                </div>
+                <div class="tab-group">
+                    <div class="tab" onclick="showTab('coco')">COCO工具</div>
+                    <div class="tab" onclick="showTab('logs')">运行日志</div>
+                </div>
             </div>
             
             <!-- 位姿提取标签页 -->
@@ -350,6 +376,219 @@
                 
                 <div style="margin-top: 10px; color:#666;">
                     提示：点击"加载第一帧并选择ROI"可在视频第一帧上拖拽选择感兴趣区域。3D火柴人实时显示关键点，可拖拽旋转查看不同角度。
+                </div>
+            </div>
+            
+            <!-- 视频动作标注标签页 -->
+            <div id="video_action" class="tab-content">
+                <h2>视频动作标注</h2>
+                <div class="info-card" style="margin-bottom: 20px;">
+                    <h3>使用说明</h3>
+                    <p>1. 选择视频文件并设置参数</p>
+                    <p>2. 点击"开始提取关键点"提取pose数据</p>
+                    <p>3. 在视频播放界面使用按钮或键盘标注动作：W(前进) A(左) S(后退) D(右) 空格(跳跃) I(静止)</p>
+                    <p>4. <strong>标注覆盖帧数</strong>：设置为1时逐帧标注，>1时批量标注（例如设置为5，则每5帧标注一次）</p>
+                    <p>5. 标注完成后点击"保存标注"</p>
+                </div>
+                
+                <div class="form-group">
+                    <label>视频路径:</label>
+                    <input type="text" id="video_action_path" placeholder="例如: ./1.mp4">
+                </div>
+                <div class="form-group">
+                    <label>模型路径:</label>
+                    <input type="text" id="video_action_model" value="./models/yolov8n-pose.pt">
+                </div>
+                <div class="form-group">
+                    <label>输出JSON路径:</label>
+                    <input type="text" id="video_action_output" placeholder="留空则自动生成">
+                </div>
+                <div class="form-group">
+                    <label>置信度阈值:</label>
+                    <input type="number" id="video_action_conf" value="0.5" min="0.1" max="1.0" step="0.1">
+                </div>
+                <div class="form-group">
+                    <label>序列长度:</label>
+                    <input type="number" id="video_action_seq_len" value="30" min="10" max="100">
+                    <small style="color: #666;">每次标注的持续时间（帧数）</small>
+                </div>
+                <div class="form-group">
+                    <label>标注覆盖帧数:</label>
+                    <input type="number" id="video_action_label_frames" value="1" min="1" max="50">
+                    <small style="color: #666;">每次标注覆盖多少帧（1=逐帧标注，>1=批量标注）</small>
+                </div>
+                <div class="form-group">
+                    <label>ROI区域 (可选):</label>
+                    <input type="text" id="video_action_roi" placeholder="格式: x,y,w,h">
+                </div>
+                
+                <button class="btn" onclick="startVideoActionLabeling()">开始提取关键点</button>
+                <button class="btn" onclick="saveVideoAnnotation()" id="save_video_annotation_btn" style="display: none;">保存标注</button>
+                
+                <div id="video_action_status" style="margin-top: 10px;"></div>
+                
+                <div id="video_action_player" style="margin-top: 20px; display: none;">
+                    <h3>视频播放与标注</h3>
+                    <div style="position: relative; background: #000; border-radius: 8px; overflow: hidden;">
+                        <canvas id="video_action_canvas" style="width: 100%; max-width: 800px; display: block;"></canvas>
+                        <div style="padding: 10px; background: rgba(0,0,0,0.7); color: white;">
+                            <div>当前帧: <span id="video_action_frame">0</span> / <span id="video_action_total_frames">0</span></div>
+                            <div>当前动作: <span id="video_action_current_action">未标注</span></div>
+                            <div style="margin-top: 10px;">
+                                <button class="btn" onclick="videoActionPlayPause()">播放/暂停</button>
+                                <button class="btn" onclick="videoActionPrevFrame()">上一帧</button>
+                                <button class="btn" onclick="videoActionNextFrame()">下一帧</button>
+                                <button class="btn" onclick="videoActionLabel('w')">W-前进</button>
+                                <button class="btn" onclick="videoActionLabel('a')">A-左</button>
+                                <button class="btn" onclick="videoActionLabel('s')">S-后退</button>
+                                <button class="btn" onclick="videoActionLabel('d')">D-右</button>
+                                <button class="btn" onclick="videoActionLabel(' ')">空格-跳跃</button>
+                                <button class="btn" onclick="videoActionLabel('idle')">I-静止</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 实时游戏标注标签页 -->
+            <div id="realtime_action" class="tab-content">
+                <h2>实时游戏画面标注</h2>
+                <div class="info-card" style="margin-bottom: 20px; background: #fff3cd; border-color: #ffc107;">
+                    <h3>⚠️ 重要提示</h3>
+                    <p>1. 此功能需要安装额外依赖: <code>pip install mss pynput</code></p>
+                    <p>2. 在Linux上可能需要sudo权限运行（用于键盘监听）</p>
+                    <p>3. 启动后请在3秒内切换到游戏窗口</p>
+                    <p>4. 按住W/A/S/D/空格进行动作，系统自动标注</p>
+                    <p>5. 按ESC键停止标注并保存</p>
+                </div>
+                
+                <div class="form-group">
+                    <label>模型路径:</label>
+                    <input type="text" id="realtime_action_model" value="./models/yolov8n-pose.pt">
+                </div>
+                <div class="form-group">
+                    <label>屏幕区域 (可选):</label>
+                    <input type="text" id="realtime_action_monitor" placeholder="格式: x,y,width,height (留空则全屏)">
+                    <small style="color: #666;">例如: 0,0,1920,1080</small>
+                </div>
+                <div class="form-group">
+                    <label>置信度阈值:</label>
+                    <input type="number" id="realtime_action_conf" value="0.5" min="0.1" max="1.0" step="0.1">
+                </div>
+                <div class="form-group">
+                    <label>捕获帧率:</label>
+                    <input type="number" id="realtime_action_fps" value="30" min="10" max="60">
+                </div>
+                <div class="form-group">
+                    <label>输出JSON路径 (可选):</label>
+                    <input type="text" id="realtime_action_output" placeholder="留空则自动生成">
+                </div>
+                <div class="form-group">
+                    <label>序列长度:</label>
+                    <input type="number" id="realtime_action_seq_len" value="30" min="10" max="100">
+                </div>
+                
+                <button class="btn" onclick="startRealtimeLabeling()">开始实时标注</button>
+                <button class="btn" onclick="stopRealtimeLabeling()" id="stop_realtime_btn" style="display: none;">停止标注</button>
+                
+                <div id="realtime_action_status" style="margin-top: 10px;"></div>
+                
+                <div id="realtime_action_preview" style="margin-top: 20px; display: none;">
+                    <h3>实时预览</h3>
+                    <div style="position: relative; background: #000; border-radius: 8px; overflow: hidden;">
+                        <div id="realtime_action_display" style="width: 100%; max-width: 800px; height: 450px; background: #111; display: flex; align-items: center; justify-content: center; color: #666;">
+                            实时画面将在这里显示
+                        </div>
+                        <div style="padding: 10px; background: rgba(0,0,0,0.7); color: white;">
+                            <div>状态: <span id="realtime_action_state">运行中</span></div>
+                            <div>当前动作: <span id="realtime_action_current">等待键盘输入</span></div>
+                            <div style="margin-top: 5px; font-size: 12px;">
+                                提示: 按住W/A/S/D/空格进行标注，按ESC停止
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 动作分类训练标签页 -->
+            <div id="action_training" class="tab-content">
+                <h2>动作分类模型训练</h2>
+                <div class="info-card" style="margin-bottom: 20px;">
+                    <h3>使用说明</h3>
+                    <p>1. 选择标注数据目录（包含多个action_labels.json文件）或单个JSON文件</p>
+                    <p>2. 设置训练参数</p>
+                    <p>3. 点击"开始训练"训练动作分类模型</p>
+                    <p>4. 训练完成后可以在"动作识别"标签页使用训练好的模型</p>
+                </div>
+                
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                    <div>
+                        <h3>数据设置</h3>
+                        <div class="form-group">
+                            <label>标注数据路径:</label>
+                            <input type="text" id="training_data_path" placeholder="例如: ./action_labels/ 或 ./1_action_labels.json">
+                            <small style="color: #666;">可以是包含多个JSON文件的目录，或单个JSON文件</small>
+                        </div>
+                        <div class="form-group">
+                            <label>输出目录:</label>
+                            <input type="text" id="training_output" value="./models/action_classifier">
+                        </div>
+                    </div>
+                    
+                    <div>
+                        <h3>模型参数</h3>
+                        <div class="form-group">
+                            <label>模型类型:</label>
+                            <select id="training_model_type">
+                                <option value="lstm" selected>LSTM（推荐）</option>
+                                <option value="gru">GRU（轻量）</option>
+                                <option value="transformer">Transformer（强大）</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>序列长度:</label>
+                            <input type="number" id="training_seq_len" value="30" min="10" max="100">
+                        </div>
+                        <div class="form-group">
+                            <label>隐藏层维度:</label>
+                            <input type="number" id="training_hidden_dim" value="128" min="32" max="512">
+                        </div>
+                        <div class="form-group">
+                            <label>层数:</label>
+                            <input type="number" id="training_num_layers" value="2" min="1" max="5">
+                        </div>
+                    </div>
+                    
+                    <div>
+                        <h3>训练参数</h3>
+                        <div class="form-group">
+                            <label>批次大小:</label>
+                            <input type="number" id="training_batch_size" value="32" min="8" max="128">
+                        </div>
+                        <div class="form-group">
+                            <label>训练轮数:</label>
+                            <input type="number" id="training_epochs" value="50" min="10" max="200">
+                        </div>
+                        <div class="form-group">
+                            <label>学习率:</label>
+                            <input type="number" id="training_lr" value="0.001" min="0.0001" max="0.01" step="0.0001">
+                        </div>
+                    </div>
+                </div>
+                
+                <div style="margin-top: 20px;">
+                    <button class="btn" onclick="startActionTraining()">开始训练</button>
+                    <button class="btn" onclick="stopActionTraining()" id="stop_training_btn" style="display: none;">停止训练</button>
+                </div>
+                
+                <div id="training_status" style="margin-top: 10px;"></div>
+                
+                <div id="training_progress" style="margin-top: 20px; display: none;">
+                    <h3>训练进度</h3>
+                    <div class="progress">
+                        <div class="progress-bar" id="training_progress_bar" style="width: 0%;"></div>
+                    </div>
+                    <div id="training_logs" class="log-container" style="height: 200px; margin-top: 10px;"></div>
                 </div>
             </div>
         </div>
@@ -1000,6 +1239,639 @@
         function cancelROISelection() {
             document.getElementById('roi_canvas_container').style.display = 'none';
             roiImage = null;
+        }
+        
+        // ========== 视频动作标注功能 ==========
+        let videoActionData = null;
+        let videoActionCurrentFrame = 0;
+        let videoActionPlaying = false;
+        let videoActionPlayInterval = null;
+        let videoActionAnnotations = {};
+        let videoActionCanvas = null;
+        let videoActionCtx = null;
+        let videoActionVideo = null;
+        
+        function startVideoActionLabeling() {
+            const videoPath = document.getElementById('video_action_path').value;
+            const modelPath = document.getElementById('video_action_model').value;
+            const outputPath = document.getElementById('video_action_output').value || null;
+            const conf = parseFloat(document.getElementById('video_action_conf').value || '0.5');
+            const seqLen = parseInt(document.getElementById('video_action_seq_len').value || '30');
+            const roi = document.getElementById('video_action_roi').value.trim() || null;
+            
+            if (!videoPath) {
+                setVideoActionStatus('error', '请填写视频路径');
+                return;
+            }
+            
+            setVideoActionStatus('info', '正在提取关键点，请稍候...');
+            
+            fetch('/api/start_video_action_labeling', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    video_path: videoPath,
+                    model_path: modelPath,
+                    output_path: outputPath,
+                    conf_threshold: conf,
+                    seq_len: seqLen,
+                    roi: roi
+                })
+            }).then(r => r.json()).then(res => {
+                if (res.error) {
+                    setVideoActionStatus('error', res.error);
+                    return;
+                }
+                setVideoActionStatus('success', '关键点提取完成！正在加载视频...');
+                
+                // 轮询状态
+                const checkInterval = setInterval(() => {
+                    fetch('/api/get_video_labeling_status')
+                        .then(r => r.json())
+                        .then(status => {
+                            if (!status.running && status.output_path) {
+                                clearInterval(checkInterval);
+                                loadVideoActionData(status.output_path, videoPath);
+                            }
+                        });
+                }, 1000);
+            }).catch(err => setVideoActionStatus('error', '启动失败: ' + err));
+        }
+        
+        function loadVideoActionData(jsonPath, videoPath) {
+            fetch('/api/get_file?path=' + encodeURIComponent(jsonPath))
+                .then(r => r.json())
+                .then(data => {
+                    videoActionData = data;
+                    videoActionAnnotations = {};
+                    // 转换标注格式
+                    if (data.annotations) {
+                        for (let start in data.annotations) {
+                            const startFrame = parseInt(start);
+                            const ends = data.annotations[start];
+                            for (let end in ends) {
+                                const endFrame = parseInt(end);
+                                if (!videoActionAnnotations[startFrame]) {
+                                    videoActionAnnotations[startFrame] = {};
+                                }
+                                videoActionAnnotations[startFrame][endFrame] = ends[end];
+                            }
+                        }
+                    }
+                    
+                    // 加载视频
+                    videoActionVideo = document.createElement('video');
+                    videoActionVideo.src = videoPath.startsWith('./') || videoPath.startsWith('/') ? 
+                        '/api/get_file?path=' + encodeURIComponent(videoPath) : videoPath;
+                    videoActionVideo.crossOrigin = 'anonymous';
+                    videoActionVideo.preload = 'metadata';
+                    
+                    videoActionVideo.addEventListener('loadedmetadata', () => {
+                        document.getElementById('video_action_total_frames').textContent = data.total_frames;
+                        videoActionCanvas = document.getElementById('video_action_canvas');
+                        videoActionCtx = videoActionCanvas.getContext('2d');
+                        videoActionCanvas.width = videoActionVideo.videoWidth;
+                        videoActionCanvas.height = videoActionVideo.videoHeight;
+                        
+                        document.getElementById('video_action_player').style.display = 'block';
+                        document.getElementById('save_video_annotation_btn').style.display = 'inline-block';
+                        videoActionCurrentFrame = 0;
+                        updateVideoActionFrame();
+                        
+                        // 添加键盘事件监听
+                        setupVideoActionKeyboard();
+                        
+                        // 自动开始播放
+                        setTimeout(() => {
+                            videoActionPlaying = true;
+                            videoActionPlayPause();
+                        }, 500);
+                    });
+                    
+                    videoActionVideo.addEventListener('error', () => {
+                        setVideoActionStatus('error', '无法加载视频文件。请确保视频路径正确。');
+                    });
+                })
+                .catch(err => setVideoActionStatus('error', '加载数据失败: ' + err));
+        }
+        
+        function updateVideoActionFrame() {
+            if (!videoActionVideo || !videoActionCanvas) return;
+            
+            videoActionVideo.currentTime = videoActionCurrentFrame / (videoActionData.fps || 30);
+            videoActionVideo.addEventListener('seeked', () => {
+                videoActionCtx.drawImage(videoActionVideo, 0, 0);
+                
+                // 绘制关键点
+                if (videoActionCurrentFrame < videoActionData.keypoint_sequence.length) {
+                    const kp = videoActionData.keypoint_sequence[videoActionCurrentFrame];
+                    if (kp && kp.length >= 34) {
+                        const h = videoActionCanvas.height;
+                        const w = videoActionCanvas.width;
+                        
+                        // 绘制关键点
+                        videoActionCtx.fillStyle = '#ffff00';
+                        for (let i = 0; i < 17; i++) {
+                            const x = kp[i * 2] * w;
+                            const y = kp[i * 2 + 1] * h;
+                            videoActionCtx.beginPath();
+                            videoActionCtx.arc(x, y, 3, 0, Math.PI * 2);
+                            videoActionCtx.fill();
+                        }
+                        
+                        // 绘制骨架连线
+                        const edges = [[0,1],[0,2],[1,3],[2,4],[0,5],[0,6],[5,7],[7,9],[6,8],[8,10],
+                                      [11,13],[13,15],[12,14],[14,16],[5,6],[11,12],[5,11],[6,12]];
+                        videoActionCtx.strokeStyle = '#00c8ff';
+                        videoActionCtx.lineWidth = 2;
+                        edges.forEach(e => {
+                            const [a, b] = e;
+                            if (a < 17 && b < 17) {
+                                videoActionCtx.beginPath();
+                                videoActionCtx.moveTo(kp[a*2]*w, kp[a*2+1]*h);
+                                videoActionCtx.lineTo(kp[b*2]*w, kp[b*2+1]*h);
+                                videoActionCtx.stroke();
+                            }
+                        });
+                    }
+                }
+                
+                // 更新当前动作显示
+                const currentAction = getVideoActionCurrentAction();
+                document.getElementById('video_action_current_action').textContent = currentAction;
+                document.getElementById('video_action_frame').textContent = videoActionCurrentFrame;
+            }, { once: true });
+        }
+        
+        function getVideoActionCurrentAction() {
+            for (let start in videoActionAnnotations) {
+                const startFrame = parseInt(start);
+                if (videoActionCurrentFrame >= startFrame) {
+                    const ends = videoActionAnnotations[start];
+                    for (let end in ends) {
+                        const endFrame = parseInt(end);
+                        if (videoActionCurrentFrame <= endFrame) {
+                            const actionId = ends[end];
+                            const actionMap = {0: 'W-前进', 1: 'A-左', 2: 'S-后退', 3: 'D-右', 4: '空格-跳跃', 5: 'I-静止'};
+                            return actionMap[actionId] || '未知';
+                        }
+                    }
+                }
+            }
+            return '未标注';
+        }
+        
+        function videoActionPlayPause() {
+            videoActionPlaying = !videoActionPlaying;
+            if (videoActionPlaying) {
+                if (videoActionPlayInterval) clearInterval(videoActionPlayInterval);
+                // 自动播放模式：持续播放，遇到未标注帧时暂停
+                videoActionPlayInterval = setInterval(() => {
+                    if (!videoActionPlaying) {
+                        clearInterval(videoActionPlayInterval);
+                        return;
+                    }
+                    
+                    const labelFrames = parseInt(document.getElementById('video_action_label_frames').value || '1');
+                    
+                    // 检查接下来需要标注的帧是否已标注
+                    let needLabel = false;
+                    let nextUnlabeledFrame = videoActionCurrentFrame + 1;
+                    
+                    for (let i = 0; i < labelFrames && (videoActionCurrentFrame + 1 + i) < videoActionData.total_frames; i++) {
+                        const checkFrame = videoActionCurrentFrame + 1 + i;
+                        if (!isFrameLabeled(checkFrame)) {
+                            needLabel = true;
+                            nextUnlabeledFrame = checkFrame;
+                            break;
+                        }
+                    }
+                    
+                    if (nextUnlabeledFrame >= videoActionData.total_frames) {
+                        // 到达末尾，停止播放
+                        videoActionPlaying = false;
+                        clearInterval(videoActionPlayInterval);
+                        setVideoActionStatus('success', '视频播放完成！');
+                        return;
+                    }
+                    
+                    if (needLabel) {
+                        // 如果有未标注的帧，暂停播放等待标注
+                        videoActionPlaying = false;
+                        clearInterval(videoActionPlayInterval);
+                        videoActionCurrentFrame = nextUnlabeledFrame;
+                        updateVideoActionFrame();
+                        setVideoActionStatus('info', `帧 ${nextUnlabeledFrame} 未标注，已暂停。请按W/A/S/D/空格/I标注。`);
+                        return;
+                    }
+                    
+                    // 如果接下来的帧都已标注，前进labelFrames帧
+                    videoActionCurrentFrame = Math.min(videoActionCurrentFrame + labelFrames, videoActionData.total_frames - 1);
+                    updateVideoActionFrame();
+                }, 1000 / (videoActionData.fps || 30));
+            } else {
+                // 暂停
+                if (videoActionPlayInterval) {
+                    clearInterval(videoActionPlayInterval);
+                    videoActionPlayInterval = null;
+                }
+                setVideoActionStatus('info', '已暂停。可以修改当前帧标签或按播放继续。');
+            }
+        }
+        
+        function isFrameLabeled(frame) {
+            for (let start in videoActionAnnotations) {
+                const startFrame = parseInt(start);
+                if (frame >= startFrame) {
+                    const ends = videoActionAnnotations[start];
+                    for (let end in ends) {
+                        const endFrame = parseInt(end);
+                        if (frame <= endFrame) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+        
+        function setupVideoActionKeyboard() {
+            // 添加全局键盘事件监听（仅在视频播放器显示时有效）
+            // 使用一次性事件监听，避免重复绑定
+            if (window.videoActionKeyboardSetup) return;
+            window.videoActionKeyboardSetup = true;
+            
+            document.addEventListener('keydown', function(e) {
+                // 检查是否在视频标注标签页
+                const videoPlayer = document.getElementById('video_action_player');
+                if (!videoPlayer || videoPlayer.style.display === 'none') return;
+                
+                // 检查焦点是否在输入框中
+                if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+                
+                const key = e.key.toLowerCase();
+                
+                // 键盘快捷键
+                if (key === 'w') {
+                    e.preventDefault();
+                    videoActionLabel('w');
+                } else if (key === 'a') {
+                    e.preventDefault();
+                    videoActionLabel('a');
+                } else if (key === 's') {
+                    e.preventDefault();
+                    videoActionLabel('s');
+                } else if (key === 'd') {
+                    e.preventDefault();
+                    videoActionLabel('d');
+                } else if (key === ' ') {
+                    e.preventDefault();
+                    // 空格键优先用于标注跳跃，而不是播放/暂停
+                    videoActionLabel(' ');
+                } else if (key === 'i') {
+                    e.preventDefault();
+                    videoActionLabel('idle');
+                } else if (key === 'p') {
+                    // P键用于播放/暂停
+                    e.preventDefault();
+                    videoActionPlayPause();
+                } else if (key === 'arrowleft') {
+                    e.preventDefault();
+                    videoActionPrevFrame();
+                    // 前进/后退时暂停播放
+                    if (videoActionPlaying) {
+                        videoActionPlaying = false;
+                        if (videoActionPlayInterval) {
+                            clearInterval(videoActionPlayInterval);
+                            videoActionPlayInterval = null;
+                        }
+                    }
+                } else if (key === 'arrowright') {
+                    e.preventDefault();
+                    videoActionNextFrame();
+                    // 前进/后退时暂停播放
+                    if (videoActionPlaying) {
+                        videoActionPlaying = false;
+                        if (videoActionPlayInterval) {
+                            clearInterval(videoActionPlayInterval);
+                            videoActionPlayInterval = null;
+                        }
+                    }
+                }
+            });
+        }
+        
+        function videoActionPrevFrame() {
+            videoActionCurrentFrame = Math.max(0, videoActionCurrentFrame - 10);
+            updateVideoActionFrame();
+        }
+        
+        function videoActionNextFrame() {
+            videoActionCurrentFrame = Math.min(videoActionData.total_frames - 1, videoActionCurrentFrame + 10);
+            updateVideoActionFrame();
+        }
+        
+        function videoActionLabel(action) {
+            if (!videoActionData) return;
+            
+            const actionMap = {'w': 0, 'a': 1, 's': 2, 'd': 3, ' ': 4, 'idle': 5};
+            const actionId = actionMap[action];
+            const seqLen = parseInt(document.getElementById('video_action_seq_len').value || '30');
+            const labelFrames = parseInt(document.getElementById('video_action_label_frames').value || '1');
+            
+            // 计算要标注的帧范围
+            const startFrame = videoActionCurrentFrame;
+            const endFrame = Math.min(videoActionCurrentFrame + seqLen - 1, videoActionData.total_frames - 1);
+            
+            // 如果设置了标注覆盖帧数 > 1，则批量标注多帧
+            if (labelFrames > 1) {
+                // 批量标注：从当前帧开始，每隔labelFrames帧标注一次
+                let labeledCount = 0;
+                for (let frame = startFrame; frame <= endFrame; frame += labelFrames) {
+                    // 清除该帧的旧标注（如果存在）
+                    if (videoActionAnnotations[frame]) {
+                        delete videoActionAnnotations[frame];
+                    }
+                    
+                    // 添加新标注
+                    if (!videoActionAnnotations[frame]) {
+                        videoActionAnnotations[frame] = {};
+                    }
+                    // 每帧的标注持续时间也是seqLen
+                    const frameEndFrame = Math.min(frame + seqLen - 1, videoActionData.total_frames - 1);
+                    videoActionAnnotations[frame][frameEndFrame] = actionId;
+                    labeledCount++;
+                }
+                
+                const actionNames = {'w': '前进', 'a': '左移', 's': '后退', 'd': '右移', ' ': '跳跃', 'idle': '静止'};
+                setVideoActionStatus('success', `已批量标注: 帧 ${startFrame}-${endFrame} (共${labeledCount}个标注点) 为 ${actionNames[action] || action.toUpperCase()}`);
+            } else {
+                // 单帧标注（原有逻辑）
+                // 如果当前帧已有标注，先清除（允许修改）
+                if (videoActionAnnotations[videoActionCurrentFrame]) {
+                    delete videoActionAnnotations[videoActionCurrentFrame];
+                }
+                
+                // 添加新标注
+                if (!videoActionAnnotations[videoActionCurrentFrame]) {
+                    videoActionAnnotations[videoActionCurrentFrame] = {};
+                }
+                videoActionAnnotations[videoActionCurrentFrame][endFrame] = actionId;
+                
+                const actionNames = {'w': '前进', 'a': '左移', 's': '后退', 'd': '右移', ' ': '跳跃', 'idle': '静止'};
+                setVideoActionStatus('success', `已标注: 帧 ${startFrame}-${endFrame} 为 ${actionNames[action] || action.toUpperCase()}`);
+            }
+            
+            updateVideoActionFrame();
+            
+            // 如果当前是暂停状态，标注后自动前进
+            if (!videoActionPlaying) {
+                // 根据标注覆盖帧数决定前进多少帧
+                const advanceFrames = labelFrames > 1 ? labelFrames : 1;
+                const nextFrame = videoActionCurrentFrame + advanceFrames;
+                
+                if (nextFrame < videoActionData.total_frames) {
+                    videoActionCurrentFrame = nextFrame;
+                    updateVideoActionFrame();
+                    
+                    // 检查接下来需要标注的帧是否已标注
+                    let needLabel = false;
+                    for (let i = 0; i < labelFrames && (nextFrame + i) < videoActionData.total_frames; i++) {
+                        if (!isFrameLabeled(nextFrame + i)) {
+                            needLabel = true;
+                            break;
+                        }
+                    }
+                    
+                    if (needLabel) {
+                        setVideoActionStatus('info', `已前进到帧 ${nextFrame}。请继续标注（W/A/S/D/空格/I）。`);
+                    } else {
+                        // 如果接下来的帧都已标注，自动继续播放
+                        setTimeout(() => {
+                            if (!videoActionPlaying) {
+                                videoActionPlaying = true;
+                                videoActionPlayPause();
+                            }
+                        }, 300);
+                    }
+                } else {
+                    setVideoActionStatus('success', '视频标注完成！');
+                }
+            }
+            // 如果正在播放，标注后会自动继续播放（由播放循环处理）
+        }
+        
+        function saveVideoAnnotation() {
+            if (!videoActionData) {
+                setVideoActionStatus('error', '没有可保存的数据');
+                return;
+            }
+            
+            let outputPath = document.getElementById('video_action_output').value;
+            if (!outputPath && videoActionData.video_path) {
+                outputPath = videoActionData.video_path.replace(/\.[^/.]+$/, '_action_labels.json');
+            }
+            
+            if (!outputPath) {
+                setVideoActionStatus('error', '请指定输出路径');
+                return;
+            }
+            
+            // 转换标注格式回原始格式
+            const annotations = {};
+            for (let start in videoActionAnnotations) {
+                const startFrame = parseInt(start);
+                const ends = videoActionAnnotations[start];
+                annotations[startFrame] = {};
+                for (let end in ends) {
+                    annotations[startFrame][parseInt(end)] = ends[end];
+                }
+            }
+            
+            fetch('/api/save_video_annotation', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    output_path: outputPath,
+                    annotations: annotations
+                })
+            }).then(r => r.json()).then(res => {
+                if (res.error) {
+                    setVideoActionStatus('error', res.error);
+                } else {
+                    setVideoActionStatus('success', '标注已保存: ' + outputPath);
+                }
+            }).catch(err => setVideoActionStatus('error', '保存失败: ' + err));
+        }
+        
+        function setVideoActionStatus(type, msg) {
+            const el = document.getElementById('video_action_status');
+            el.className = type;
+            el.textContent = msg;
+        }
+        
+        // ========== 实时游戏标注功能 ==========
+        let realtimeLabelingStatusInterval = null;
+        
+        function startRealtimeLabeling() {
+            const modelPath = document.getElementById('realtime_action_model').value;
+            const monitor = document.getElementById('realtime_action_monitor').value.trim() || null;
+            const conf = parseFloat(document.getElementById('realtime_action_conf').value || '0.5');
+            const fps = parseFloat(document.getElementById('realtime_action_fps').value || '30');
+            const outputPath = document.getElementById('realtime_action_output').value.trim() || null;
+            const seqLen = parseInt(document.getElementById('realtime_action_seq_len').value || '30');
+            
+            setRealtimeActionStatus('info', '正在启动实时标注...');
+            
+            fetch('/api/start_realtime_labeling', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model_path: modelPath,
+                    monitor: monitor,
+                    conf_threshold: conf,
+                    fps: fps,
+                    output_path: outputPath,
+                    seq_len: seqLen
+                })
+            }).then(r => r.json()).then(res => {
+                if (res.error) {
+                    setRealtimeActionStatus('error', res.error);
+                    return;
+                }
+                setRealtimeActionStatus('success', '实时标注已启动！请在3秒内切换到游戏窗口');
+                document.getElementById('stop_realtime_btn').style.display = 'inline-block';
+                document.getElementById('realtime_action_preview').style.display = 'block';
+                
+                // 轮询状态
+                realtimeLabelingStatusInterval = setInterval(() => {
+                    fetch('/api/get_realtime_labeling_status')
+                        .then(r => r.json())
+                        .then(status => {
+                            if (status.running) {
+                                document.getElementById('realtime_action_state').textContent = '运行中';
+                            } else {
+                                clearInterval(realtimeLabelingStatusInterval);
+                                document.getElementById('realtime_action_state').textContent = '已停止';
+                                if (status.output_path) {
+                                    setRealtimeActionStatus('success', '标注已保存: ' + status.output_path);
+                                }
+                            }
+                        });
+                }, 1000);
+            }).catch(err => setRealtimeActionStatus('error', '启动失败: ' + err));
+        }
+        
+        function stopRealtimeLabeling() {
+            fetch('/api/stop_realtime_labeling', { method: 'POST' })
+                .then(r => r.json())
+                .then(res => {
+                    setRealtimeActionStatus('info', res.message || '停止指令已发送');
+                    if (realtimeLabelingStatusInterval) {
+                        clearInterval(realtimeLabelingStatusInterval);
+                        realtimeLabelingStatusInterval = null;
+                    }
+                })
+                .catch(err => setRealtimeActionStatus('error', '停止失败: ' + err));
+        }
+        
+        function setRealtimeActionStatus(type, msg) {
+            const el = document.getElementById('realtime_action_status');
+            el.className = type;
+            el.textContent = msg;
+        }
+        
+        // ========== 动作分类训练功能 ==========
+        let trainingStatusInterval = null;
+        
+        function startActionTraining() {
+            const dataPath = document.getElementById('training_data_path').value;
+            const modelType = document.getElementById('training_model_type').value;
+            const seqLen = parseInt(document.getElementById('training_seq_len').value || '30');
+            const hiddenDim = parseInt(document.getElementById('training_hidden_dim').value || '128');
+            const numLayers = parseInt(document.getElementById('training_num_layers').value || '2');
+            const batchSize = parseInt(document.getElementById('training_batch_size').value || '32');
+            const epochs = parseInt(document.getElementById('training_epochs').value || '50');
+            const lr = parseFloat(document.getElementById('training_lr').value || '0.001');
+            const outputDir = document.getElementById('training_output').value || './models/action_classifier';
+            
+            if (!dataPath) {
+                setTrainingStatus('error', '请填写标注数据路径');
+                return;
+            }
+            
+            setTrainingStatus('info', '正在启动训练...');
+            document.getElementById('training_progress').style.display = 'block';
+            document.getElementById('stop_training_btn').style.display = 'inline-block';
+            
+            fetch('/api/start_action_training', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    data_path: dataPath,
+                    model_type: modelType,
+                    seq_len: seqLen,
+                    hidden_dim: hiddenDim,
+                    num_layers: numLayers,
+                    batch_size: batchSize,
+                    epochs: epochs,
+                    learning_rate: lr,
+                    output_dir: outputDir
+                })
+            }).then(r => r.json()).then(res => {
+                if (res.error) {
+                    setTrainingStatus('error', res.error);
+                    return;
+                }
+                setTrainingStatus('success', '训练已启动');
+                
+                // 轮询训练状态
+                trainingStatusInterval = setInterval(() => {
+                    fetch('/api/get_training_status')
+                        .then(r => r.json())
+                        .then(status => {
+                            if (status.running) {
+                                // 更新进度
+                                if (status.current_epoch && status.total_epochs) {
+                                    const progress = (status.current_epoch / status.total_epochs) * 100;
+                                    document.getElementById('training_progress_bar').style.width = progress + '%';
+                                }
+                                
+                                // 更新日志
+                                if (status.logs && status.logs.length > 0) {
+                                    const logsDiv = document.getElementById('training_logs');
+                                    logsDiv.innerHTML = status.logs.slice(-20).map(log => `<div>${log}</div>`).join('');
+                                    logsDiv.scrollTop = logsDiv.scrollHeight;
+                                }
+                            } else {
+                                clearInterval(trainingStatusInterval);
+                                document.getElementById('stop_training_btn').style.display = 'none';
+                                if (status.message) {
+                                    setTrainingStatus('success', status.message);
+                                }
+                            }
+                        });
+                }, 2000);
+            }).catch(err => setTrainingStatus('error', '启动失败: ' + err));
+        }
+        
+        function stopActionTraining() {
+            fetch('/api/stop_action_training', { method: 'POST' })
+                .then(r => r.json())
+                .then(res => {
+                    setTrainingStatus('info', res.message || '停止指令已发送');
+                    if (trainingStatusInterval) {
+                        clearInterval(trainingStatusInterval);
+                        trainingStatusInterval = null;
+                    }
+                })
+                .catch(err => setTrainingStatus('error', '停止失败: ' + err));
+        }
+        
+        function setTrainingStatus(type, msg) {
+            const el = document.getElementById('training_status');
+            el.className = type;
+            el.textContent = msg;
         }
         
         // 页面加载时自动加载数据集信息

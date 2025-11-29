@@ -49,6 +49,21 @@ pose_stream_state = {
     'model': None
 }
 
+# 动作标注状态
+action_labeling_state = {
+    'video_labeling': {
+        'running': False,
+        'thread': None,
+        'output_path': None
+    },
+    'realtime_labeling': {
+        'running': False,
+        'thread': None,
+        'stop_flag': False,
+        'output_path': None
+    }
+}
+
 def setup_logging():
     """设置日志"""
     logging.basicConfig(
@@ -441,6 +456,31 @@ def select_best_keypoints(result):
         })
     return kp_list
 
+@app.route('/api/get_file')
+def get_file():
+    """获取文件内容（用于JSON或视频文件）"""
+    try:
+        file_path = request.args.get('path')
+        if not file_path:
+            return jsonify({'error': '文件路径未指定'}), 400
+        
+        if not os.path.exists(file_path):
+            return jsonify({'error': '文件不存在'}), 404
+        
+        # 如果是JSON文件，返回JSON
+        if file_path.endswith('.json'):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return jsonify(json.load(f))
+        # 如果是视频文件，返回文件
+        elif file_path.endswith(('.mp4', '.avi', '.mov', '.mkv')):
+            return send_file(file_path, mimetype='video/mp4')
+        else:
+            return jsonify({'error': '不支持的文件类型'}), 400
+            
+    except Exception as e:
+        logging.error(f'获取文件失败: {e}', exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/get_video_first_frame', methods=['POST'])
 def get_video_first_frame():
     """获取视频第一帧，用于ROI选择"""
@@ -745,6 +785,395 @@ def pose_stream():
     }
     return Response(event_source(), headers=headers, mimetype='text/event-stream')
 
+@app.route('/api/start_video_action_labeling', methods=['POST'])
+def start_video_action_labeling():
+    """启动视频动作标注"""
+    global action_labeling_state
+    
+    if YOLO is None:
+        return jsonify({'error': 'ultralytics未安装'}), 500
+    
+    if action_labeling_state['video_labeling']['running']:
+        return jsonify({'error': '视频标注已在运行中'}), 400
+    
+    try:
+        data = request.json or {}
+        video_path = data.get('video_path')
+        model_path = data.get('model_path', './models/yolov8n-pose.pt')
+        output_path = data.get('output_path')
+        conf_threshold = float(data.get('conf_threshold', 0.5))
+        seq_len = int(data.get('seq_len', 30))
+        roi_str = data.get('roi')
+        
+        if not video_path or not os.path.exists(video_path):
+            return jsonify({'error': '视频文件不存在'}), 400
+        if not os.path.exists(model_path):
+            return jsonify({'error': '模型文件不存在'}), 400
+        
+        # 确定输出路径
+        if not output_path:
+            video_name = Path(video_path).stem
+            output_path = f"{video_name}_action_labels.json"
+        
+        # 解析ROI
+        roi = None
+        if roi_str:
+            try:
+                parts = roi_str.split(',')
+                if len(parts) == 4:
+                    roi = tuple(int(p.strip()) for p in parts)
+            except Exception:
+                pass
+        
+        # 导入标注函数
+        from video_action_labeler import extract_keypoints_from_video, ACTION_MAP
+        
+        def worker():
+            try:
+                action_labeling_state['video_labeling']['running'] = True
+                logging.info(f'开始视频动作标注: {video_path}')
+                
+                # 提取关键点
+                keypoint_sequence, frame_indices, fps = extract_keypoints_from_video(
+                    video_path, model_path, conf_threshold, roi
+                )
+                
+                # 创建空的标注数据（用户需要在客户端进行标注）
+                data = {
+                    'video_path': video_path,
+                    'total_frames': len(keypoint_sequence),
+                    'fps': fps,
+                    'keypoint_sequence': keypoint_sequence,
+                    'frame_indices': frame_indices,
+                    'annotations': {},
+                    'action_map': ACTION_MAP
+                }
+                
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                
+                action_labeling_state['video_labeling']['output_path'] = output_path
+                logging.info(f'关键点提取完成，保存到: {output_path}')
+                
+            except Exception as e:
+                logging.error(f'视频标注错误: {e}', exc_info=True)
+            finally:
+                action_labeling_state['video_labeling']['running'] = False
+        
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        action_labeling_state['video_labeling']['thread'] = t
+        
+        return jsonify({
+            'message': '视频标注已启动',
+            'output_path': output_path
+        })
+        
+    except Exception as e:
+        logging.error(f'启动视频标注失败: {e}', exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/get_video_labeling_status')
+def get_video_labeling_status():
+    """获取视频标注状态"""
+    global action_labeling_state
+    state = action_labeling_state['video_labeling']
+    return jsonify({
+        'running': state['running'],
+        'output_path': state.get('output_path')
+    })
+
+@app.route('/api/save_video_annotation', methods=['POST'])
+def save_video_annotation():
+    """保存视频标注"""
+    try:
+        data = request.json or {}
+        output_path = data.get('output_path')
+        annotations = data.get('annotations', {})
+        
+        if not output_path:
+            return jsonify({'error': '输出路径未指定'}), 400
+        
+        # 加载现有数据
+        if os.path.exists(output_path):
+            with open(output_path, 'r', encoding='utf-8') as f:
+                file_data = json.load(f)
+        else:
+            return jsonify({'error': '标注文件不存在'}), 400
+        
+        # 更新标注
+        file_data['annotations'] = annotations
+        
+        # 保存
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(file_data, f, indent=2, ensure_ascii=False)
+        
+        return jsonify({'message': '标注已保存'})
+        
+    except Exception as e:
+        logging.error(f'保存标注失败: {e}', exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/start_realtime_labeling', methods=['POST'])
+def start_realtime_labeling():
+    """启动实时游戏标注"""
+    global action_labeling_state
+    
+    if YOLO is None:
+        return jsonify({'error': 'ultralytics未安装'}), 500
+    
+    if action_labeling_state['realtime_labeling']['running']:
+        return jsonify({'error': '实时标注已在运行中'}), 400
+    
+    try:
+        data = request.json or {}
+        model_path = data.get('model_path', './models/yolov8n-pose.pt')
+        monitor_str = data.get('monitor')
+        conf_threshold = float(data.get('conf_threshold', 0.5))
+        fps = float(data.get('fps', 30))
+        output_path = data.get('output_path')
+        seq_len = int(data.get('seq_len', 30))
+        
+        if not os.path.exists(model_path):
+            return jsonify({'error': '模型文件不存在'}), 400
+        
+        # 确定输出路径
+        if not output_path:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = f"game_action_labels_{timestamp}.json"
+        
+        # 解析monitor
+        monitor = None
+        if monitor_str:
+            try:
+                parts = monitor_str.split(',')
+                if len(parts) == 4:
+                    monitor = tuple(int(p.strip()) for p in parts)
+            except Exception:
+                pass
+        
+        # 检查依赖
+        try:
+            from pynput import keyboard
+        except ImportError:
+            return jsonify({'error': '需要安装pynput: pip install pynput'}), 500
+        
+        try:
+            import mss
+        except ImportError:
+            logging.warning('mss未安装，将使用PIL进行屏幕捕获')
+        
+        # 导入实时标注类
+        from realtime_game_labeler import RealtimeGameLabeler
+        
+        def worker():
+            try:
+                action_labeling_state['realtime_labeling']['running'] = True
+                action_labeling_state['realtime_labeling']['stop_flag'] = False
+                
+                labeler = RealtimeGameLabeler(
+                    model_path=model_path,
+                    monitor=monitor,
+                    conf_threshold=conf_threshold,
+                    sequence_length=seq_len,
+                    output_path=output_path,
+                    fps=fps
+                )
+                
+                # 设置停止标志检查
+                def check_stop():
+                    while action_labeling_state['realtime_labeling']['running']:
+                        if action_labeling_state['realtime_labeling'].get('stop_flag'):
+                            labeler.stop_flag = True
+                            break
+                        time.sleep(0.1)
+                
+                stop_thread = threading.Thread(target=check_stop, daemon=True)
+                stop_thread.start()
+                
+                try:
+                    labeler.run()
+                except Exception as e:
+                    logging.error(f'实时标注运行错误: {e}', exc_info=True)
+                
+            except Exception as e:
+                logging.error(f'实时标注错误: {e}', exc_info=True)
+            finally:
+                action_labeling_state['realtime_labeling']['running'] = False
+                action_labeling_state['realtime_labeling']['output_path'] = output_path
+        
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        action_labeling_state['realtime_labeling']['thread'] = t
+        
+        return jsonify({
+            'message': '实时标注已启动',
+            'output_path': output_path
+        })
+        
+    except Exception as e:
+        logging.error(f'启动实时标注失败: {e}', exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/stop_realtime_labeling', methods=['POST'])
+def stop_realtime_labeling():
+    """停止实时标注"""
+    global action_labeling_state
+    
+    if not action_labeling_state['realtime_labeling']['running']:
+        return jsonify({'message': '未在运行'})
+    
+    action_labeling_state['realtime_labeling']['stop_flag'] = True
+    return jsonify({'message': '停止指令已发送'})
+
+@app.route('/api/get_realtime_labeling_status')
+def get_realtime_labeling_status():
+    """获取实时标注状态"""
+    global action_labeling_state
+    state = action_labeling_state['realtime_labeling']
+    return jsonify({
+        'running': state['running'],
+        'output_path': state.get('output_path')
+    })
+
+# 动作训练状态
+action_training_state = {
+    'running': False,
+    'thread': None,
+    'stop_flag': False,
+    'logs': [],
+    'current_epoch': 0,
+    'total_epochs': 0
+}
+
+@app.route('/api/start_action_training', methods=['POST'])
+def start_action_training():
+    """启动动作分类模型训练"""
+    global action_training_state
+    
+    if action_training_state['running']:
+        return jsonify({'error': '训练已在运行中'}), 400
+    
+    try:
+        data = request.json or {}
+        data_path = data.get('data_path')
+        model_type = data.get('model_type', 'lstm')
+        seq_len = int(data.get('seq_len', 30))
+        hidden_dim = int(data.get('hidden_dim', 128))
+        num_layers = int(data.get('num_layers', 2))
+        batch_size = int(data.get('batch_size', 32))
+        epochs = int(data.get('epochs', 50))
+        learning_rate = float(data.get('learning_rate', 0.001))
+        output_dir = data.get('output_dir', './models/action_classifier')
+        
+        if not data_path:
+            return jsonify({'error': '请指定标注数据路径'}), 400
+        
+        if not os.path.exists(data_path):
+            return jsonify({'error': '数据路径不存在'}), 400
+        
+        # 导入训练函数
+        from train_action_classifier import train_action_classifier
+        
+        def worker():
+            try:
+                action_training_state['running'] = True
+                action_training_state['stop_flag'] = False
+                action_training_state['logs'] = []
+                action_training_state['current_epoch'] = 0
+                action_training_state['total_epochs'] = epochs
+                
+                # 重定向日志到状态
+                import sys
+                from io import StringIO
+                import builtins
+                
+                class TrainingLogHandler(logging.Handler):
+                    def emit(self, record):
+                        log_entry = self.format(record)
+                        action_training_state['logs'].append(log_entry)
+                        if len(action_training_state['logs']) > 200:
+                            action_training_state['logs'] = action_training_state['logs'][-200:]
+                
+                # 捕获print输出
+                original_print = builtins.print
+                def captured_print(*args, **kwargs):
+                    msg = ' '.join(str(arg) for arg in args)
+                    action_training_state['logs'].append(msg)
+                    if len(action_training_state['logs']) > 200:
+                        action_training_state['logs'] = action_training_state['logs'][-200:]
+                    original_print(*args, **kwargs, flush=True)
+                
+                # 临时替换print函数
+                builtins.print = captured_print
+                
+                log_handler = TrainingLogHandler()
+                log_handler.setFormatter(logging.Formatter('%(message)s'))
+                training_logger = logging.getLogger('training')
+                training_logger.addHandler(log_handler)
+                training_logger.setLevel(logging.INFO)
+                
+                try:
+                    train_action_classifier(
+                        data_dir=data_path,
+                        model_type=model_type,
+                        sequence_length=seq_len,
+                        hidden_dim=hidden_dim,
+                        num_layers=num_layers,
+                        batch_size=batch_size,
+                        epochs=epochs,
+                        learning_rate=learning_rate,
+                        device='cuda' if os.system('nvidia-smi > /dev/null 2>&1') == 0 else 'cpu',
+                        output_dir=output_dir
+                    )
+                except Exception as e:
+                    logging.error(f'训练错误: {e}', exc_info=True)
+                    action_training_state['logs'].append(f'训练错误: {str(e)}')
+                    print(f'训练错误: {e}', flush=True)
+                finally:
+                    # 恢复原始print函数
+                    try:
+                        builtins.print = original_print
+                    except:
+                        pass
+                    action_training_state['running'] = False
+            except Exception as e:
+                logging.error(f'训练线程错误: {e}', exc_info=True)
+                action_training_state['running'] = False
+        
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        action_training_state['thread'] = t
+        
+        return jsonify({'message': '训练已启动'})
+        
+    except Exception as e:
+        logging.error(f'启动训练失败: {e}', exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/stop_action_training', methods=['POST'])
+def stop_action_training():
+    """停止训练"""
+    global action_training_state
+    
+    if not action_training_state['running']:
+        return jsonify({'message': '未在运行'})
+    
+    action_training_state['stop_flag'] = True
+    return jsonify({'message': '停止指令已发送'})
+
+@app.route('/api/get_training_status')
+def get_training_status():
+    """获取训练状态"""
+    global action_training_state
+    return jsonify({
+        'running': action_training_state['running'],
+        'current_epoch': action_training_state.get('current_epoch', 0),
+        'total_epochs': action_training_state.get('total_epochs', 0),
+        'logs': action_training_state.get('logs', [])[-20:]  # 最近20条日志
+    })
+
 if __name__ == '__main__':
     setup_logging()
     
@@ -752,8 +1181,12 @@ if __name__ == '__main__':
     templates_dir = Path('templates')
     templates_dir.mkdir(exist_ok=True)
     
-    # 创建HTML模板
-    html_content = '''
+    # 只在文件不存在时生成，避免覆盖用户修改
+    html_file = templates_dir / 'index.html'
+    if not html_file.exists():
+        logging.info('index.html不存在，正在生成...')
+        # 创建HTML模板
+        html_content = '''
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -922,6 +1355,8 @@ if __name__ == '__main__':
                 <div class="tab" onclick="showTab('dataset')">数据集信息</div>
                 <div class="tab" onclick="showTab('logs')">运行日志</div>
                 <div class="tab" onclick="showTab('pose3d')">3D火柴人</div>
+                <div class="tab" onclick="showTab('video_action')">视频动作标注</div>
+                <div class="tab" onclick="showTab('realtime_action')">实时游戏标注</div>
             </div>
             
             <!-- 位姿提取标签页 -->
@@ -1757,6 +2192,335 @@ if __name__ == '__main__':
             roiImage = null;
         }
         
+        // ========== 视频动作标注功能 ==========
+        let videoActionData = null;
+        let videoActionCurrentFrame = 0;
+        let videoActionPlaying = false;
+        let videoActionPlayInterval = null;
+        let videoActionAnnotations = {};
+        let videoActionCanvas = null;
+        let videoActionCtx = null;
+        let videoActionVideo = null;
+        
+        function startVideoActionLabeling() {
+            const videoPath = document.getElementById('video_action_path').value;
+            const modelPath = document.getElementById('video_action_model').value;
+            const outputPath = document.getElementById('video_action_output').value || null;
+            const conf = parseFloat(document.getElementById('video_action_conf').value || '0.5');
+            const seqLen = parseInt(document.getElementById('video_action_seq_len').value || '30');
+            const roi = document.getElementById('video_action_roi').value.trim() || null;
+            
+            if (!videoPath) {
+                setVideoActionStatus('error', '请填写视频路径');
+                return;
+            }
+            
+            setVideoActionStatus('info', '正在提取关键点，请稍候...');
+            
+            fetch('/api/start_video_action_labeling', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    video_path: videoPath,
+                    model_path: modelPath,
+                    output_path: outputPath,
+                    conf_threshold: conf,
+                    seq_len: seqLen,
+                    roi: roi
+                })
+            }).then(r => r.json()).then(res => {
+                if (res.error) {
+                    setVideoActionStatus('error', res.error);
+                    return;
+                }
+                setVideoActionStatus('success', '关键点提取完成！正在加载视频...');
+                
+                const checkInterval = setInterval(() => {
+                    fetch('/api/get_video_labeling_status')
+                        .then(r => r.json())
+                        .then(status => {
+                            if (!status.running && status.output_path) {
+                                clearInterval(checkInterval);
+                                loadVideoActionData(status.output_path, videoPath);
+                            }
+                        });
+                }, 1000);
+            }).catch(err => setVideoActionStatus('error', '启动失败: ' + err));
+        }
+        
+        function loadVideoActionData(jsonPath, videoPath) {
+            fetch('/api/get_file?path=' + encodeURIComponent(jsonPath))
+                .then(r => r.json())
+                .then(data => {
+                    videoActionData = data;
+                    videoActionAnnotations = {};
+                    if (data.annotations) {
+                        for (let start in data.annotations) {
+                            const startFrame = parseInt(start);
+                            const ends = data.annotations[start];
+                            for (let end in ends) {
+                                const endFrame = parseInt(end);
+                                if (!videoActionAnnotations[startFrame]) {
+                                    videoActionAnnotations[startFrame] = {};
+                                }
+                                videoActionAnnotations[startFrame][endFrame] = ends[end];
+                            }
+                        }
+                    }
+                    
+                    videoActionVideo = document.createElement('video');
+                    videoActionVideo.src = videoPath.startsWith('./') || videoPath.startsWith('/') ? 
+                        '/api/get_file?path=' + encodeURIComponent(videoPath) : videoPath;
+                    videoActionVideo.crossOrigin = 'anonymous';
+                    videoActionVideo.preload = 'metadata';
+                    
+                    videoActionVideo.addEventListener('loadedmetadata', () => {
+                        document.getElementById('video_action_total_frames').textContent = data.total_frames;
+                        videoActionCanvas = document.getElementById('video_action_canvas');
+                        videoActionCtx = videoActionCanvas.getContext('2d');
+                        videoActionCanvas.width = videoActionVideo.videoWidth;
+                        videoActionCanvas.height = videoActionVideo.videoHeight;
+                        
+                        document.getElementById('video_action_player').style.display = 'block';
+                        document.getElementById('save_video_annotation_btn').style.display = 'inline-block';
+                        videoActionCurrentFrame = 0;
+                        updateVideoActionFrame();
+                    });
+                    
+                    videoActionVideo.addEventListener('error', () => {
+                        setVideoActionStatus('error', '无法加载视频文件。请确保视频路径正确。');
+                    });
+                })
+                .catch(err => setVideoActionStatus('error', '加载数据失败: ' + err));
+        }
+        
+        function updateVideoActionFrame() {
+            if (!videoActionVideo || !videoActionCanvas) return;
+            
+            videoActionVideo.currentTime = videoActionCurrentFrame / (videoActionData.fps || 30);
+            videoActionVideo.addEventListener('seeked', () => {
+                videoActionCtx.drawImage(videoActionVideo, 0, 0);
+                
+                if (videoActionCurrentFrame < videoActionData.keypoint_sequence.length) {
+                    const kp = videoActionData.keypoint_sequence[videoActionCurrentFrame];
+                    if (kp && kp.length >= 34) {
+                        const h = videoActionCanvas.height;
+                        const w = videoActionCanvas.width;
+                        
+                        videoActionCtx.fillStyle = '#ffff00';
+                        for (let i = 0; i < 17; i++) {
+                            const x = kp[i * 2] * w;
+                            const y = kp[i * 2 + 1] * h;
+                            videoActionCtx.beginPath();
+                            videoActionCtx.arc(x, y, 3, 0, Math.PI * 2);
+                            videoActionCtx.fill();
+                        }
+                        
+                        const edges = [[0,1],[0,2],[1,3],[2,4],[0,5],[0,6],[5,7],[7,9],[6,8],[8,10],
+                                      [11,13],[13,15],[12,14],[14,16],[5,6],[11,12],[5,11],[6,12]];
+                        videoActionCtx.strokeStyle = '#00c8ff';
+                        videoActionCtx.lineWidth = 2;
+                        edges.forEach(e => {
+                            const [a, b] = e;
+                            if (a < 17 && b < 17) {
+                                videoActionCtx.beginPath();
+                                videoActionCtx.moveTo(kp[a*2]*w, kp[a*2+1]*h);
+                                videoActionCtx.lineTo(kp[b*2]*w, kp[b*2+1]*h);
+                                videoActionCtx.stroke();
+                            }
+                        });
+                    }
+                }
+                
+                const currentAction = getVideoActionCurrentAction();
+                document.getElementById('video_action_current_action').textContent = currentAction;
+                document.getElementById('video_action_frame').textContent = videoActionCurrentFrame;
+            }, { once: true });
+        }
+        
+        function getVideoActionCurrentAction() {
+            for (let start in videoActionAnnotations) {
+                const startFrame = parseInt(start);
+                if (videoActionCurrentFrame >= startFrame) {
+                    const ends = videoActionAnnotations[start];
+                    for (let end in ends) {
+                        const endFrame = parseInt(end);
+                        if (videoActionCurrentFrame <= endFrame) {
+                            const actionId = ends[end];
+                            const actionMap = {0: 'W-前进', 1: 'A-左', 2: 'S-后退', 3: 'D-右', 4: '空格-跳跃', 5: 'I-静止'};
+                            return actionMap[actionId] || '未知';
+                        }
+                    }
+                }
+            }
+            return '未标注';
+        }
+        
+        function videoActionPlayPause() {
+            videoActionPlaying = !videoActionPlaying;
+            if (videoActionPlaying) {
+                if (videoActionPlayInterval) clearInterval(videoActionPlayInterval);
+                videoActionPlayInterval = setInterval(() => {
+                    if (!videoActionPlaying) {
+                        clearInterval(videoActionPlayInterval);
+                        return;
+                    }
+                    videoActionCurrentFrame = (videoActionCurrentFrame + 1) % videoActionData.total_frames;
+                    updateVideoActionFrame();
+                }, 1000 / (videoActionData.fps || 30));
+            } else {
+                if (videoActionPlayInterval) {
+                    clearInterval(videoActionPlayInterval);
+                    videoActionPlayInterval = null;
+                }
+            }
+        }
+        
+        function videoActionPrevFrame() {
+            videoActionCurrentFrame = Math.max(0, videoActionCurrentFrame - 10);
+            updateVideoActionFrame();
+        }
+        
+        function videoActionNextFrame() {
+            videoActionCurrentFrame = Math.min(videoActionData.total_frames - 1, videoActionCurrentFrame + 10);
+            updateVideoActionFrame();
+        }
+        
+        function videoActionLabel(action) {
+            if (!videoActionData) return;
+            
+            const actionMap = {'w': 0, 'a': 1, 's': 2, 'd': 3, ' ': 4, 'idle': 5};
+            const actionId = actionMap[action];
+            const seqLen = parseInt(document.getElementById('video_action_seq_len').value || '30');
+            const endFrame = Math.min(videoActionCurrentFrame + seqLen - 1, videoActionData.total_frames - 1);
+            
+            if (!videoActionAnnotations[videoActionCurrentFrame]) {
+                videoActionAnnotations[videoActionCurrentFrame] = {};
+            }
+            videoActionAnnotations[videoActionCurrentFrame][endFrame] = actionId;
+            
+            setVideoActionStatus('success', `已标注: 帧 ${videoActionCurrentFrame}-${endFrame} 为 ${action.toUpperCase()}`);
+            updateVideoActionFrame();
+        }
+        
+        function saveVideoAnnotation() {
+            if (!videoActionData) {
+                setVideoActionStatus('error', '没有可保存的数据');
+                return;
+            }
+            
+            let outputPath = document.getElementById('video_action_output').value;
+            if (!outputPath && videoActionData.video_path) {
+                outputPath = videoActionData.video_path.replace(/\.[^/.]+$/, '_action_labels.json');
+            }
+            
+            if (!outputPath) {
+                setVideoActionStatus('error', '请指定输出路径');
+                return;
+            }
+            
+            const annotations = {};
+            for (let start in videoActionAnnotations) {
+                const startFrame = parseInt(start);
+                const ends = videoActionAnnotations[start];
+                annotations[startFrame] = {};
+                for (let end in ends) {
+                    annotations[startFrame][parseInt(end)] = ends[end];
+                }
+            }
+            
+            fetch('/api/save_video_annotation', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    output_path: outputPath,
+                    annotations: annotations
+                })
+            }).then(r => r.json()).then(res => {
+                if (res.error) {
+                    setVideoActionStatus('error', res.error);
+                } else {
+                    setVideoActionStatus('success', '标注已保存: ' + outputPath);
+                }
+            }).catch(err => setVideoActionStatus('error', '保存失败: ' + err));
+        }
+        
+        function setVideoActionStatus(type, msg) {
+            const el = document.getElementById('video_action_status');
+            el.className = type;
+            el.textContent = msg;
+        }
+        
+        // ========== 实时游戏标注功能 ==========
+        let realtimeLabelingStatusInterval = null;
+        
+        function startRealtimeLabeling() {
+            const modelPath = document.getElementById('realtime_action_model').value;
+            const monitor = document.getElementById('realtime_action_monitor').value.trim() || null;
+            const conf = parseFloat(document.getElementById('realtime_action_conf').value || '0.5');
+            const fps = parseFloat(document.getElementById('realtime_action_fps').value || '30');
+            const outputPath = document.getElementById('realtime_action_output').value.trim() || null;
+            const seqLen = parseInt(document.getElementById('realtime_action_seq_len').value || '30');
+            
+            setRealtimeActionStatus('info', '正在启动实时标注...');
+            
+            fetch('/api/start_realtime_labeling', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model_path: modelPath,
+                    monitor: monitor,
+                    conf_threshold: conf,
+                    fps: fps,
+                    output_path: outputPath,
+                    seq_len: seqLen
+                })
+            }).then(r => r.json()).then(res => {
+                if (res.error) {
+                    setRealtimeActionStatus('error', res.error);
+                    return;
+                }
+                setRealtimeActionStatus('success', '实时标注已启动！请在3秒内切换到游戏窗口');
+                document.getElementById('stop_realtime_btn').style.display = 'inline-block';
+                document.getElementById('realtime_action_preview').style.display = 'block';
+                
+                realtimeLabelingStatusInterval = setInterval(() => {
+                    fetch('/api/get_realtime_labeling_status')
+                        .then(r => r.json())
+                        .then(status => {
+                            if (status.running) {
+                                document.getElementById('realtime_action_state').textContent = '运行中';
+                            } else {
+                                clearInterval(realtimeLabelingStatusInterval);
+                                document.getElementById('realtime_action_state').textContent = '已停止';
+                                if (status.output_path) {
+                                    setRealtimeActionStatus('success', '标注已保存: ' + status.output_path);
+                                }
+                            }
+                        });
+                }, 1000);
+            }).catch(err => setRealtimeActionStatus('error', '启动失败: ' + err));
+        }
+        
+        function stopRealtimeLabeling() {
+            fetch('/api/stop_realtime_labeling', { method: 'POST' })
+                .then(r => r.json())
+                .then(res => {
+                    setRealtimeActionStatus('info', res.message || '停止指令已发送');
+                    if (realtimeLabelingStatusInterval) {
+                        clearInterval(realtimeLabelingStatusInterval);
+                        realtimeLabelingStatusInterval = null;
+                    }
+                })
+                .catch(err => setRealtimeActionStatus('error', '停止失败: ' + err));
+        }
+        
+        function setRealtimeActionStatus(type, msg) {
+            const el = document.getElementById('realtime_action_status');
+            el.className = type;
+            el.textContent = msg;
+        }
+        
         // 页面加载时自动加载数据集信息
         window.onload = function() {
             loadDatasetInfo();
@@ -1767,9 +2531,12 @@ if __name__ == '__main__':
 </body>
 </html>
     '''
-    
-    with open('templates/index.html', 'w', encoding='utf-8') as f:
-        f.write(html_content)
+        
+        with open('templates/index.html', 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        logging.info('index.html已生成')
+    else:
+        logging.info('index.html已存在，跳过生成（保留用户修改）')
     
     
     app.run(host='0.0.0.0', port=8080, debug=False)

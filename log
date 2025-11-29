@@ -39,3 +39,10 @@ day7
 
 day8
 学习GCN，ST-GCN
+
+day9
+时序深度学习模型 LSTM（双向识别）
+直接训练关键点动作对应的wasd及空格键位代表移动和跳跃
+
+day10
+用ST-GCN识别动作
