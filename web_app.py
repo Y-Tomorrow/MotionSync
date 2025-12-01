@@ -46,7 +46,8 @@ pose_stream_state = {
     'stop_flag': False,
     'thread': None,
     'queue': None,
-    'model': None
+    'model': None,
+    'action_model': None
 }
 
 # 动作标注状态
@@ -533,6 +534,7 @@ def start_video_pose():
         conf_threshold = float(data.get('conf_threshold', 0.5))
         roi_str = data.get('roi')  # 格式: "x,y,w,h" 或 None
         playback_speed = float(data.get('playback_speed', 1.0))  # 播放速度倍数，1.0=正常速度
+        action_model_path = data.get('action_model_path')  # ST-GCN模型路径（可选）
         
         if not video_path or not os.path.exists(video_path):
             return jsonify({'error': '视频文件不存在'}), 400
@@ -555,11 +557,60 @@ def start_video_pose():
         
         def worker():
             cap = None
+            action_model = None
+            keypoint_buffer = None
+            action_names = None
+            sequence_length = 30
+            
             try:
                 logging.info('加载YOLO姿态模型中...')
                 model = YOLO(model_path)
                 pose_stream_state['model'] = model
-                logging.info('模型加载完成，开始读取视频')
+                logging.info('模型加载完成')
+                
+                # 加载ST-GCN动作识别模型（如果提供）
+                if action_model_path and os.path.exists(action_model_path):
+                    try:
+                        import torch
+                        from collections import deque
+                        from action_classifier import ActionClassifierSTGCN
+                        
+                        logging.info(f'加载ST-GCN动作识别模型: {action_model_path}')
+                        checkpoint = torch.load(action_model_path, map_location='cpu')
+                        
+                        # 获取模型参数
+                        num_nodes = checkpoint.get('num_nodes', 17)
+                        in_channels = checkpoint.get('in_channels', 2)
+                        num_classes = checkpoint.get('num_classes', 6)
+                        action_map = checkpoint.get('action_map', {})
+                        sequence_length = checkpoint.get('sequence_length', 30)
+                        
+                        # 创建模型
+                        action_model = ActionClassifierSTGCN(
+                            num_nodes=num_nodes,
+                            in_channels=in_channels,
+                            num_classes=num_classes
+                        )
+                        action_model.load_state_dict(checkpoint['model_state_dict'])
+                        action_model.eval()
+                        
+                        # 创建动作名称映射
+                        action_names = {v: k for k, v in action_map.items()}
+                        if not action_names:
+                            action_names = {0: 'W-前进', 1: 'A-左', 2: 'S-后退', 3: 'D-右', 4: '空格-跳跃', 5: 'I-静止'}
+                        
+                        # 初始化关键点缓冲区
+                        keypoint_buffer = deque(maxlen=sequence_length)
+                        
+                        pose_stream_state['action_model'] = action_model
+                        logging.info(f'ST-GCN模型加载完成，序列长度: {sequence_length}')
+                    except Exception as e:
+                        logging.warning(f'加载ST-GCN模型失败: {e}，将仅进行关键点检测')
+                        action_model = None
+                else:
+                    logging.info('未提供ST-GCN模型路径，将仅进行关键点检测')
+                
+                logging.info('开始读取视频')
                 
                 cap = cv2.VideoCapture(video_path)
                 if not cap.isOpened():
@@ -626,6 +677,41 @@ def start_video_pose():
                         bbox_center = np.array([(x_min + x_max) / 2.0, (y_min + y_max) / 2.0])
                         center_ema = (1.0 - alpha) * center_ema + alpha * bbox_center
                     
+                    # ST-GCN动作识别
+                    current_action = None
+                    action_confidence = 0.0
+                    if action_model is not None and best_kp:
+                        try:
+                            import torch
+                            # 将关键点转换为numpy数组 (17, 2)
+                            kp_array = np.array([[p['x'], p['y']] for p in best_kp], dtype=np.float32)
+                            # 添加到缓冲区
+                            keypoint_buffer.append(kp_array.flatten())  # (34,)
+                            
+                            # 当缓冲区满时进行推理
+                            if len(keypoint_buffer) == sequence_length:
+                                # 准备输入: (1, time, nodes, channels)
+                                seq_array = np.array(list(keypoint_buffer), dtype=np.float32)  # (seq_len, 34)
+                                seq_array = seq_array.reshape(1, sequence_length, 17, 2)  # (1, seq_len, 17, 2)
+                                seq_tensor = torch.FloatTensor(seq_array)
+                                
+                                # 推理
+                                with torch.no_grad():
+                                    outputs = action_model(seq_tensor)
+                                    probs = torch.softmax(outputs, dim=1)
+                                    confidence, predicted = torch.max(probs, 1)
+                                    
+                                    action_id = predicted.item()
+                                    action_confidence = confidence.item()
+                                    current_action = action_names.get(action_id, f"class_{action_id}")
+                        except Exception as e:
+                            logging.warning(f'ST-GCN推理失败: {e}')
+                            current_action = None
+                    elif action_model is not None and not best_kp and keypoint_buffer:
+                        # 如果没有检测到关键点，使用上一帧填充
+                        if len(keypoint_buffer) > 0:
+                            keypoint_buffer.append(keypoint_buffer[-1])
+                    
                     # 每帧都发送视频帧，通过降低质量和适度缩放来平衡性能
                     frame_base64 = None
                     # 在帧上绘制关键点和ROI框
@@ -681,6 +767,11 @@ def start_video_pose():
                         'ts': time.time()
                     }
                     
+                    # 添加动作识别结果
+                    if current_action is not None:
+                        payload['action'] = current_action
+                        payload['action_confidence'] = float(action_confidence)
+                    
                     try:
                         q.put(payload, timeout=0.5)
                     except queue.Full:
@@ -714,6 +805,7 @@ def start_video_pose():
                     cap.release()
                 pose_stream_state['running'] = False
                 pose_stream_state['model'] = None
+                pose_stream_state['action_model'] = None
                 try:
                     q.put({'type': 'eof'})
                 except Exception:
@@ -1044,7 +1136,9 @@ action_training_state = {
     'stop_flag': False,
     'logs': [],
     'current_epoch': 0,
-    'total_epochs': 0
+    'total_epochs': 0,
+    'output_dir': './models/action_classifier',
+    'model_type': 'lstm'
 }
 
 @app.route('/api/start_action_training', methods=['POST'])
@@ -1083,6 +1177,8 @@ def start_action_training():
                 action_training_state['logs'] = []
                 action_training_state['current_epoch'] = 0
                 action_training_state['total_epochs'] = epochs
+                action_training_state['output_dir'] = output_dir
+                action_training_state['model_type'] = model_type
                 
                 # 重定向日志到状态
                 import sys
@@ -1093,28 +1189,110 @@ def start_action_training():
                     def emit(self, record):
                         log_entry = self.format(record)
                         action_training_state['logs'].append(log_entry)
-                        if len(action_training_state['logs']) > 200:
-                            action_training_state['logs'] = action_training_state['logs'][-200:]
+                        # 保持最近500条日志
+                        if len(action_training_state['logs']) > 500:
+                            action_training_state['logs'] = action_training_state['logs'][-500:]
                 
-                # 捕获print输出
+                # 捕获print输出和stdout
                 original_print = builtins.print
+                original_stdout = sys.stdout
+                
+                class CapturedStdout:
+                    """捕获stdout输出"""
+                    def __init__(self, original):
+                        self.original = original
+                        self.buffer = ''  # 缓冲区，用于处理不完整的行
+                    
+                    def write(self, text):
+                        if text:
+                            # 移除ANSI颜色代码
+                            import re
+                            clean_text = re.sub(r'\x1b\[[0-9;]*m', '', text)
+                            
+                            # 将文本添加到缓冲区
+                            self.buffer += clean_text
+                            
+                            # 处理完整的行（以换行符结尾）
+                            while '\n' in self.buffer:
+                                line, self.buffer = self.buffer.split('\n', 1)
+                                line = line.strip()
+                                if line:  # 只添加非空行
+                                    action_training_state['logs'].append(line)
+                                    # 保持最近500条日志（增加容量以便查看完整训练过程）
+                                    if len(action_training_state['logs']) > 500:
+                                        action_training_state['logs'] = action_training_state['logs'][-500:]
+                        
+                        self.original.write(text)
+                        self.original.flush()
+                    
+                    def flush(self):
+                        # 如果缓冲区有内容，也添加到日志
+                        if self.buffer.strip():
+                            line = self.buffer.strip()
+                            action_training_state['logs'].append(line)
+                            # 保持最近500条日志
+                            if len(action_training_state['logs']) > 500:
+                                action_training_state['logs'] = action_training_state['logs'][-500:]
+                            self.buffer = ''
+                        self.original.flush()
+                    
+                    def __getattr__(self, name):
+                        return getattr(self.original, name)
+                
+                captured_stdout = CapturedStdout(original_stdout)
+                sys.stdout = captured_stdout
+                
                 def captured_print(*args, **kwargs):
                     msg = ' '.join(str(arg) for arg in args)
-                    action_training_state['logs'].append(msg)
-                    if len(action_training_state['logs']) > 200:
-                        action_training_state['logs'] = action_training_state['logs'][-200:]
-                    original_print(*args, **kwargs, flush=True)
+                    if msg.strip():  # 只添加非空消息
+                        # 移除ANSI颜色代码
+                        import re
+                        clean_msg = re.sub(r'\x1b\[[0-9;]*m', '', msg).strip()
+                        if clean_msg:
+                            action_training_state['logs'].append(clean_msg)
+                            # 保持最近500条日志
+                            if len(action_training_state['logs']) > 500:
+                                action_training_state['logs'] = action_training_state['logs'][-500:]
+                    # 确保立即输出到控制台和日志
+                    # 如果kwargs中已经有flush，先提取出来，避免重复
+                    flush_value = kwargs.pop('flush', True)  # 默认flush=True
+                    original_print(*args, **kwargs, flush=flush_value)
+                    # 也输出到logging
+                    if msg.strip():
+                        logging.info(msg)
                 
                 # 临时替换print函数
                 builtins.print = captured_print
                 
+                # 设置日志处理器，捕获所有日志输出
                 log_handler = TrainingLogHandler()
                 log_handler.setFormatter(logging.Formatter('%(message)s'))
+                
+                # 为根日志记录器添加处理器，确保捕获所有日志
+                root_logger = logging.getLogger()
+                root_logger.addHandler(log_handler)
+                root_logger.setLevel(logging.INFO)
+                
+                # 也为training logger添加
                 training_logger = logging.getLogger('training')
                 training_logger.addHandler(log_handler)
                 training_logger.setLevel(logging.INFO)
                 
+                # 确保train_action_classifier模块的日志也被捕获
+                train_module_logger = logging.getLogger('train_action_classifier')
+                train_module_logger.addHandler(log_handler)
+                train_module_logger.setLevel(logging.INFO)
+                
                 try:
+                    # 测试日志捕获是否工作
+                    print("测试日志捕获...", flush=True)
+                    action_training_state['logs'].append('=' * 60)
+                    action_training_state['logs'].append('开始训练动作分类模型')
+                    action_training_state['logs'].append(f'模型类型: {model_type}')
+                    action_training_state['logs'].append(f'训练轮数: {epochs}')
+                    action_training_state['logs'].append('=' * 60)
+                    print("日志捕获测试完成，开始训练...", flush=True)
+                    
                     train_action_classifier(
                         data_dir=data_path,
                         model_type=model_type,
@@ -1127,14 +1305,20 @@ def start_action_training():
                         device='cuda' if os.system('nvidia-smi > /dev/null 2>&1') == 0 else 'cpu',
                         output_dir=output_dir
                     )
+                    
+                    # 训练完成后添加结束信息
+                    action_training_state['logs'].append('=' * 60)
+                    action_training_state['logs'].append('训练完成！')
+                    action_training_state['logs'].append('=' * 60)
                 except Exception as e:
                     logging.error(f'训练错误: {e}', exc_info=True)
                     action_training_state['logs'].append(f'训练错误: {str(e)}')
                     print(f'训练错误: {e}', flush=True)
                 finally:
-                    # 恢复原始print函数
+                    # 恢复原始print函数和stdout
                     try:
                         builtins.print = original_print
+                        sys.stdout = original_stdout
                     except:
                         pass
                     action_training_state['running'] = False
@@ -1167,12 +1351,58 @@ def stop_action_training():
 def get_training_status():
     """获取训练状态"""
     global action_training_state
-    return jsonify({
+    output_dir = action_training_state.get('output_dir', './models/action_classifier')
+    model_type = action_training_state.get('model_type', 'lstm')
+    
+    # 检查训练结果图片是否存在
+    training_curves_path = os.path.join(output_dir, f'training_curves_{model_type}.png')
+    confusion_matrix_path = os.path.join(output_dir, f'confusion_matrix_{model_type}.png')
+    
+    # 获取所有日志（不只是最近20条），让用户能看到完整的训练过程
+    all_logs = action_training_state.get('logs', [])
+    result = {
         'running': action_training_state['running'],
         'current_epoch': action_training_state.get('current_epoch', 0),
         'total_epochs': action_training_state.get('total_epochs', 0),
-        'logs': action_training_state.get('logs', [])[-20:]  # 最近20条日志
-    })
+        'logs': all_logs,  # 返回所有日志，让前端显示完整训练过程
+        'logs_count': len(all_logs),  # 日志总数，用于调试
+        'has_training_curves': os.path.exists(training_curves_path),
+        'has_confusion_matrix': os.path.exists(confusion_matrix_path)
+    }
+    
+    if result['has_training_curves']:
+        result['training_curves_path'] = training_curves_path
+    if result['has_confusion_matrix']:
+        result['confusion_matrix_path'] = confusion_matrix_path
+    
+    return jsonify(result)
+
+@app.route('/api/get_training_image')
+def get_training_image():
+    """获取训练结果图片"""
+    try:
+        image_path = request.args.get('path')
+        if not image_path:
+            return jsonify({'error': '图片路径未指定'}), 400
+        
+        # 转换为绝对路径
+        if not os.path.isabs(image_path):
+            image_path = os.path.join(os.getcwd(), image_path.lstrip('./'))
+        
+        # 安全检查：确保路径在允许的目录内
+        if not os.path.exists(image_path):
+            return jsonify({'error': '图片文件不存在'}), 404
+        
+        # 只允许访问模型输出目录下的图片
+        allowed_base = os.path.join(os.getcwd(), 'models', 'action_classifier')
+        image_abs = os.path.abspath(image_path)
+        if not image_abs.startswith(os.path.abspath(allowed_base)):
+            return jsonify({'error': '不允许访问该路径'}), 403
+        
+        return send_file(image_path, mimetype='image/png')
+    except Exception as e:
+        logging.error(f'获取训练图片失败: {e}', exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     setup_logging()

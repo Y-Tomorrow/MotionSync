@@ -355,10 +355,26 @@
                     <input type="number" id="pose_speed" value="1.0" min="0.1" max="5.0" step="0.1">
                     <small style="color: #666;">1.0=正常速度，2.0=2倍速，0.5=0.5倍速</small>
                 </div>
+                <div class="form-group">
+                    <label>ST-GCN动作识别模型路径 (可选):</label>
+                    <input type="text" id="pose_action_model" placeholder="例如: ./models/action_classifier/stgcn_best.pth">
+                    <small style="color: #666;">留空则仅显示关键点，不进行动作识别</small>
+                </div>
                 <button class="btn" onclick="startPoseStream()">开始</button>
                 <button class="btn" onclick="stopPoseStream()">停止</button>
 
                 <div id="pose_status" style="margin-top: 10px;"></div>
+                
+                <!-- 动作识别结果显示 -->
+                <div id="pose_action_display" style="margin-top: 15px; padding: 15px; background: #f8f9fa; border-radius: 8px; display: none;">
+                    <h3 style="margin-top: 0;">动作识别结果 (ST-GCN)</h3>
+                    <div style="font-size: 18px; font-weight: bold; color: #667eea;">
+                        动作: <span id="pose_action_name">-</span>
+                    </div>
+                    <div style="font-size: 14px; color: #666; margin-top: 5px;">
+                        置信度: <span id="pose_action_conf">0.00</span>
+                    </div>
+                </div>
                 
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 15px;">
                     <div>
@@ -543,6 +559,7 @@
                                 <option value="lstm" selected>LSTM（推荐）</option>
                                 <option value="gru">GRU（轻量）</option>
                                 <option value="transformer">Transformer（强大）</option>
+                                <option value="stgcn">ST-GCN（图卷积，适合动作识别）</option>
                             </select>
                         </div>
                         <div class="form-group">
@@ -585,10 +602,36 @@
                 
                 <div id="training_progress" style="margin-top: 20px; display: none;">
                     <h3>训练进度</h3>
-                    <div class="progress">
+                    <div style="margin-bottom: 10px;">
+                        <div>当前轮次: <span id="training_current_epoch">0</span> / <span id="training_total_epochs">0</span></div>
+                        <div class="progress" style="margin-top: 5px;">
                         <div class="progress-bar" id="training_progress_bar" style="width: 0%;"></div>
                     </div>
-                    <div id="training_logs" class="log-container" style="height: 200px; margin-top: 10px;"></div>
+                </div>
+                    <div id="training_logs" class="log-container" style="height: 300px; margin-top: 10px;">
+                        <div style="color: #666; padding: 10px;">等待训练日志...</div>
+                    </div>
+                </div>
+                
+                <!-- 训练结果图片显示区域 -->
+                <div id="training_results" style="margin-top: 20px; display: none;">
+                    <h3>训练结果</h3>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                        <div>
+                            <h4>训练曲线</h4>
+                            <img id="training_curves_img" src="" alt="训练曲线" style="width: 100%; border: 1px solid #ddd; border-radius: 8px; display: none;">
+                            <div id="training_curves_placeholder" style="width: 100%; height: 300px; background: #f8f9fa; border: 1px solid #ddd; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #666;">
+                                训练完成后将显示训练曲线
+                            </div>
+                        </div>
+                        <div>
+                            <h4>混淆矩阵</h4>
+                            <img id="confusion_matrix_img" src="" alt="混淆矩阵" style="width: 100%; border: 1px solid #ddd; border-radius: 8px; display: none;">
+                            <div id="confusion_matrix_placeholder" style="width: 100%; height: 300px; background: #f8f9fa; border: 1px solid #ddd; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #666;">
+                                训练完成后将显示混淆矩阵
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1046,6 +1089,7 @@
             const modelPath = document.getElementById('pose_model_path').value;
             const conf = parseFloat(document.getElementById('pose_conf').value || '0.5');
             const roi = document.getElementById('pose_roi').value.trim() || null;
+            const actionModelPath = document.getElementById('pose_action_model').value.trim() || null;
             
             if (!videoPath) {
                 setPoseStatus('error', '请填写视频路径');
@@ -1061,6 +1105,9 @@
             };
             if (roi) {
                 data.roi = roi;
+            }
+            if (actionModelPath) {
+                data.action_model_path = actionModelPath;
             }
             
             fetch('/api/start_video_pose', {
@@ -1100,6 +1147,21 @@
                                 
                                 imgEl.style.display = 'block';
                                 if (placeholder) placeholder.style.display = 'none';
+                            }
+                            
+                            // 显示动作识别结果
+                            if (data.action !== undefined) {
+                                const actionDisplay = document.getElementById('pose_action_display');
+                                const actionName = document.getElementById('pose_action_name');
+                                const actionConf = document.getElementById('pose_action_conf');
+                                
+                                actionDisplay.style.display = 'block';
+                                actionName.textContent = data.action;
+                                actionConf.textContent = (data.action_confidence || 0).toFixed(2);
+                            } else {
+                                // 如果没有动作识别结果，隐藏显示区域
+                                const actionDisplay = document.getElementById('pose_action_display');
+                                actionDisplay.style.display = 'none';
                             }
                         } else if (data.type === 'error') {
                             setPoseStatus('error', data.message);
@@ -1831,17 +1893,42 @@
                         .then(r => r.json())
                         .then(status => {
                             if (status.running) {
-                                // 更新进度
+                                // 更新轮次信息
+                                const currentEpochEl = document.getElementById('training_current_epoch');
+                                const totalEpochsEl = document.getElementById('training_total_epochs');
+                                if (currentEpochEl && status.current_epoch !== undefined) {
+                                    currentEpochEl.textContent = status.current_epoch;
+                                }
+                                if (totalEpochsEl && status.total_epochs !== undefined) {
+                                    totalEpochsEl.textContent = status.total_epochs;
+                                }
+                                
+                                // 更新进度条
                                 if (status.current_epoch && status.total_epochs) {
                                     const progress = (status.current_epoch / status.total_epochs) * 100;
-                                    document.getElementById('training_progress_bar').style.width = progress + '%';
+                                    const progressBar = document.getElementById('training_progress_bar');
+                                    if (progressBar) {
+                                        progressBar.style.width = progress + '%';
+                                    }
                                 }
                                 
                                 // 更新日志
-                                if (status.logs && status.logs.length > 0) {
                                     const logsDiv = document.getElementById('training_logs');
-                                    logsDiv.innerHTML = status.logs.slice(-20).map(log => `<div>${log}</div>`).join('');
+                                if (logsDiv) {
+                                    if (status.logs && status.logs.length > 0) {
+                                        // 显示所有日志
+                                        logsDiv.innerHTML = status.logs.map(log => {
+                                            // 转义HTML特殊字符
+                                            const escaped = String(log).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                                            return `<div>${escaped}</div>`;
+                                        }).join('');
                                     logsDiv.scrollTop = logsDiv.scrollHeight;
+                                    } else {
+                                        // 如果没有日志，显示等待提示
+                                        if (logsDiv.innerHTML.trim() === '' || logsDiv.innerHTML.includes('等待训练日志')) {
+                                            logsDiv.innerHTML = '<div style="color: #666; padding: 10px;">等待训练日志...</div>';
+                                        }
+                                    }
                                 }
                             } else {
                                 clearInterval(trainingStatusInterval);
@@ -1849,6 +1936,9 @@
                                 if (status.message) {
                                     setTrainingStatus('success', status.message);
                                 }
+                                
+                                // 训练完成后，尝试加载训练结果图片
+                                loadTrainingResults(status);
                             }
                         });
                 }, 2000);
@@ -1872,6 +1962,40 @@
             const el = document.getElementById('training_status');
             el.className = type;
             el.textContent = msg;
+        }
+        
+        function loadTrainingResults(status) {
+            // 显示训练结果区域
+            const resultsDiv = document.getElementById('training_results');
+            resultsDiv.style.display = 'block';
+            
+            // 加载训练曲线
+            if (status.has_training_curves && status.training_curves_path) {
+                const img = document.getElementById('training_curves_img');
+                const placeholder = document.getElementById('training_curves_placeholder');
+                img.src = '/api/get_training_image?path=' + encodeURIComponent(status.training_curves_path);
+                img.onload = function() {
+                    img.style.display = 'block';
+                    if (placeholder) placeholder.style.display = 'none';
+                };
+                img.onerror = function() {
+                    console.error('加载训练曲线失败');
+                };
+            }
+            
+            // 加载混淆矩阵
+            if (status.has_confusion_matrix && status.confusion_matrix_path) {
+                const img = document.getElementById('confusion_matrix_img');
+                const placeholder = document.getElementById('confusion_matrix_placeholder');
+                img.src = '/api/get_training_image?path=' + encodeURIComponent(status.confusion_matrix_path);
+                img.onload = function() {
+                    img.style.display = 'block';
+                    if (placeholder) placeholder.style.display = 'none';
+                };
+                img.onerror = function() {
+                    console.error('加载混淆矩阵失败');
+                };
+            }
         }
         
         // 页面加载时自动加载数据集信息

@@ -190,3 +190,147 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:x.size(1), :].transpose(0, 1)
         return self.dropout(x)
 
+
+class STGCNBlock(nn.Module):
+    """ST-GCN基本块：空间图卷积 + 时间卷积"""
+    
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, residual=True):
+        super(STGCNBlock, self).__init__()
+        
+        self.kernel_size = kernel_size
+        self.residual = residual
+        
+        # 空间图卷积（使用1x1卷积近似）
+        self.spatial_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        
+        # 时间卷积
+        self.temporal_conv = nn.Conv2d(
+            out_channels, out_channels, 
+            kernel_size=(kernel_size, 1), 
+            stride=(stride, 1),
+            padding=((kernel_size - 1) // 2, 0)
+        )
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        # 残差连接
+        if residual:
+            if in_channels != out_channels or stride != 1:
+                self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(stride, 1))
+                self.residual_bn = nn.BatchNorm2d(out_channels)
+            else:
+                self.residual_conv = None
+                self.residual_bn = None
+    
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, channels, time, nodes)
+        """
+        residual = x
+        
+        # 空间图卷积
+        out = self.spatial_conv(x)
+        out = self.bn1(out)
+        out = F.relu(out)
+        
+        # 时间卷积
+        out = self.temporal_conv(out)
+        out = self.bn2(out)
+        
+        # 残差连接
+        if self.residual:
+            if self.residual_conv is not None:
+                residual = self.residual_conv(residual)
+                residual = self.residual_bn(residual)
+            out = out + residual
+        
+        out = F.relu(out)
+        return out
+
+
+class ActionClassifierSTGCN(nn.Module):
+    """基于ST-GCN的动作分类模型"""
+    
+    def __init__(self, num_nodes=17, in_channels=2, num_classes=6, dropout=0.3):
+        """
+        Args:
+            num_nodes: 关键点数量 (COCO pose = 17)
+            in_channels: 每个关键点的特征维度 (x, y = 2)
+            num_classes: 动作类别数
+            dropout: Dropout比率
+        """
+        super(ActionClassifierSTGCN, self).__init__()
+        
+        self.num_nodes = num_nodes
+        self.in_channels = in_channels
+        self.num_classes = num_classes
+        
+        # 输入投影
+        self.input_proj = nn.Conv2d(in_channels, 64, kernel_size=1)
+        self.bn_input = nn.BatchNorm2d(64)
+        
+        # ST-GCN块
+        self.stgcn1 = STGCNBlock(64, 64, kernel_size=9, stride=1)
+        self.stgcn2 = STGCNBlock(64, 64, kernel_size=9, stride=1)
+        self.stgcn3 = STGCNBlock(64, 128, kernel_size=9, stride=2)
+        self.stgcn4 = STGCNBlock(128, 128, kernel_size=9, stride=1)
+        self.stgcn5 = STGCNBlock(128, 256, kernel_size=9, stride=2)
+        self.stgcn6 = STGCNBlock(256, 256, kernel_size=9, stride=1)
+        
+        # 全局池化
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # 分类头
+        self.fc1 = nn.Linear(256, 128)
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(128, num_classes)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, time, nodes, channels) -> 需要转换为 (batch, channels, time, nodes)
+               或 (batch, time, features) -> 需要reshape
+        Returns:
+            logits: (batch, num_classes)
+        """
+        # 处理不同的输入格式
+        if len(x.shape) == 3:
+            # (batch, time, features) -> (batch, time, nodes, channels)
+            # features应该是 nodes * channels
+            batch, time, features = x.shape
+            if features == self.num_nodes * self.in_channels:
+                x = x.view(batch, time, self.num_nodes, self.in_channels)
+            else:
+                # 假设是扁平化的关键点序列
+                x = x.view(batch, time, self.num_nodes, self.in_channels)
+        
+        # 转换为 (batch, channels, time, nodes)
+        if len(x.shape) == 4:
+            x = x.permute(0, 3, 1, 2)  # (batch, channels, time, nodes)
+        
+        # 输入投影
+        x = self.input_proj(x)
+        x = self.bn_input(x)
+        x = F.relu(x)
+        
+        # ST-GCN块
+        x = self.stgcn1(x)
+        x = self.stgcn2(x)
+        x = self.stgcn3(x)
+        x = self.stgcn4(x)
+        x = self.stgcn5(x)
+        x = self.stgcn6(x)
+        
+        # 全局池化
+        x = self.global_pool(x)  # (batch, 256, 1, 1)
+        x = x.view(x.size(0), -1)  # (batch, 256)
+        
+        # 分类
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        
+        return x
+

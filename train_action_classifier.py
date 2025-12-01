@@ -6,6 +6,7 @@
 """
 
 import os
+import sys
 import json
 import numpy as np
 import torch
@@ -16,7 +17,15 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 import argparse
 from pathlib import Path
+import matplotlib
+# 设置非GUI后端，避免在后台线程中使用GUI导致崩溃
+# 必须在导入pyplot之前设置，并且要强制设置
+import os
+os.environ['MPLBACKEND'] = 'Agg'  # 通过环境变量强制设置
+matplotlib.use('Agg', force=True)  # force=True 强制设置，即使已经导入过
 import matplotlib.pyplot as plt
+# 确保使用非交互式后端
+plt.ioff()  # 关闭交互模式
 
 # seaborn为可选依赖
 try:
@@ -26,7 +35,12 @@ except ImportError:
     HAS_SEABORN = False
     print("警告: seaborn未安装，混淆矩阵将使用matplotlib绘制。建议安装: pip install seaborn")
 
-from action_classifier import ActionClassifier, ActionClassifierGRU, ActionClassifierTransformer
+try:
+    from action_classifier import ActionClassifier, ActionClassifierGRU, ActionClassifierTransformer, ActionClassifierSTGCN
+    print("✓ 成功导入动作分类模型", flush=True)
+except ImportError as e:
+    print(f"✗ 导入动作分类模型失败: {e}", flush=True)
+    raise
 
 
 class ActionDataset(Dataset):
@@ -39,24 +53,49 @@ class ActionDataset(Dataset):
             labels: 标签列表，每个元素是动作类别ID
             sequence_length: 序列长度
         """
+        import sys
         self.sequences = []
         self.labels = []
         
-        for seq, label in zip(sequences, labels):
+        total = len(sequences)
+        print(f"    总共需要处理 {total} 个序列", flush=True)
+        sys.stdout.flush()
+        
+        for idx, (seq, label) in enumerate(zip(sequences, labels)):
+            # 确保seq是numpy数组
+            if not isinstance(seq, np.ndarray):
+                seq = np.array(seq, dtype=np.float32)
+            
             # 确保序列长度一致
-            if len(seq) < sequence_length:
+            seq_len = seq.shape[0] if len(seq.shape) > 0 else len(seq)
+            
+            if seq_len < sequence_length:
                 # 如果序列太短，重复最后一帧
-                padding = [seq[-1]] * (sequence_length - len(seq))
-                seq = seq + padding
-            elif len(seq) > sequence_length:
+                if isinstance(seq, np.ndarray):
+                    last_frame = seq[-1:]
+                    padding = np.repeat(last_frame, sequence_length - seq_len, axis=0)
+                    seq = np.concatenate([seq, padding], axis=0)
+                else:
+                    padding = [seq[-1]] * (sequence_length - seq_len)
+                    seq = seq + padding
+            elif seq_len > sequence_length:
                 # 如果序列太长，截取
                 seq = seq[:sequence_length]
             
             self.sequences.append(seq)
             self.labels.append(label)
+            
+            # 每处理10%的数据输出一次进度
+            if (idx + 1) % max(1, total // 10) == 0 or (idx + 1) == total:
+                print(f"    进度: {idx + 1}/{total} ({100 * (idx + 1) / total:.1f}%)", flush=True)
+                sys.stdout.flush()
         
+        print(f"    正在转换为numpy数组...", flush=True)
+        sys.stdout.flush()
         self.sequences = np.array(self.sequences, dtype=np.float32)
         self.labels = np.array(self.labels, dtype=np.int64)
+        print(f"    转换完成，最终形状: {self.sequences.shape}", flush=True)
+        sys.stdout.flush()
         
     def __len__(self):
         return len(self.sequences)
@@ -262,13 +301,29 @@ def train_action_classifier(
     print(f"验证集: {len(X_val)} 样本")
     
     # 创建数据集和数据加载器
-    train_dataset = ActionDataset(X_train, y_train, sequence_length)
-    val_dataset = ActionDataset(X_val, y_val, sequence_length)
+    print("\n正在创建数据集...", flush=True)
+    import sys
+    sys.stdout.flush()
     
+    print(f"  处理训练集 ({len(X_train)} 样本)...", flush=True)
+    sys.stdout.flush()
+    train_dataset = ActionDataset(X_train, y_train, sequence_length)
+    print(f"  训练集创建完成", flush=True)
+    sys.stdout.flush()
+    
+    print(f"  处理验证集 ({len(X_val)} 样本)...", flush=True)
+    sys.stdout.flush()
+    val_dataset = ActionDataset(X_val, y_val, sequence_length)
+    print("数据集创建完成", flush=True)
+    sys.stdout.flush()
+    
+    print("正在创建数据加载器...", flush=True)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    print("数据加载器创建完成", flush=True)
     
     # 创建模型
+    print(f"\n正在创建模型 ({model_type})...", flush=True)
     num_classes = len(action_map)
     input_dim = 34  # 17个关键点 * 2坐标
     
@@ -295,31 +350,69 @@ def train_action_classifier(
             num_classes=num_classes,
             dropout=0.3
         )
+    elif model_type == 'stgcn':
+        # ST-GCN使用不同的参数
+        print(f"    创建ST-GCN模型: num_nodes=17, in_channels=2, num_classes={num_classes}", flush=True)
+        model = ActionClassifierSTGCN(
+            num_nodes=17,  # COCO pose 17个关键点
+            in_channels=2,  # x, y坐标
+            num_classes=num_classes,
+            dropout=0.3
+        )
+        print(f"    ST-GCN模型创建完成", flush=True)
     else:
-        raise ValueError(f"未知的模型类型: {model_type}")
+        raise ValueError(f"未知的模型类型: {model_type}，支持的类型: lstm, gru, transformer, stgcn")
     
+    print(f"正在将模型移动到设备: {device}...", flush=True)
     model = model.to(device)
+    print(f"模型已移动到设备: {device}", flush=True)
+    
     print(f"\n模型: {model_type}")
     print(f"参数量: {sum(p.numel() for p in model.parameters()):,}")
     print(f"设备: {device}")
     
     # 损失函数和优化器
+    print("正在初始化损失函数和优化器...", flush=True)
     # 如果数据不平衡，使用类别权重
     if len(unique) > 1:
-        class_counts = np.bincount(labels_array)
+        # 为所有类别计算权重（包括没有样本的类别）
+        # num_classes是模型的总类别数，可能大于实际数据中的类别数
+        class_counts = np.bincount(labels_array, minlength=num_classes)
         total = len(labels_array)
+        
+        # 避免除零：如果某个类别没有样本，使用平滑处理
+        class_counts = class_counts.astype(np.float32)
+        class_counts[class_counts == 0] = 0.5  # 平滑处理，避免权重过大
+        
         class_weights = total / (len(unique) * class_counts)
         class_weights = torch.FloatTensor(class_weights).to(device)
-        print(f"使用类别权重: {dict(zip([action_names.get(i, f'class_{i}') for i in range(len(class_weights))], class_weights.cpu().numpy()))}")
+        
+        # 显示权重信息
+        weight_dict = {}
+        for i in range(num_classes):
+            action_name = action_names.get(i, f'class_{i}')
+            count = int(class_counts[i])
+            weight_dict[action_name] = {
+                'weight': float(class_weights[i].cpu().numpy()),
+                'count': count
+            }
+        print(f"使用类别权重:")
+        for name, info in weight_dict.items():
+            print(f"  {name}: weight={info['weight']:.4f}, count={info['count']}")
+        sys.stdout.flush()
+        
         criterion = nn.CrossEntropyLoss(weight=class_weights)
     else:
         criterion = nn.CrossEntropyLoss()
     
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    print("优化器初始化完成", flush=True)
     
     # 训练
+    print(f"正在创建输出目录: {output_dir}...", flush=True)
     os.makedirs(output_dir, exist_ok=True)
+    print("输出目录准备完成", flush=True)
     best_val_acc = 0
     train_losses = []
     val_losses = []
@@ -372,23 +465,37 @@ def train_action_classifier(
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             model_path = os.path.join(output_dir, f'best_{model_type}_action_classifier.pth')
-            torch.save({
+            save_dict = {
                 'model_state_dict': model.state_dict(),
                 'model_type': model_type,
-                'input_dim': input_dim,
-                'hidden_dim': hidden_dim,
-                'num_layers': num_layers,
                 'num_classes': num_classes,
                 'sequence_length': sequence_length,
                 'action_map': action_map,
                 'epoch': epoch,
                 'val_acc': val_acc
-            }, model_path)
+            }
+            
+            # 根据模型类型保存不同的参数
+            if model_type == 'stgcn':
+                save_dict.update({
+                    'num_nodes': 17,
+                    'in_channels': 2
+                })
+            else:
+                save_dict.update({
+                    'input_dim': input_dim,
+                    'hidden_dim': hidden_dim,
+                    'num_layers': num_layers
+                })
+            
+            torch.save(save_dict, model_path)
             print(f"  ✓ 保存最佳模型 (Val Acc: {val_acc:.2f}%)")
             sys.stdout.flush()
     
     # 绘制训练曲线
-    plt.figure(figsize=(12, 4))
+    # 确保关闭所有已打开的figure，避免GUI相关错误
+    plt.close('all')
+    fig = plt.figure(figsize=(12, 4))
     
     plt.subplot(1, 2, 1)
     plt.plot(train_losses, label='Train Loss')
@@ -407,21 +514,43 @@ def train_action_classifier(
     plt.title('Training and Validation Accuracy')
     
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'training_curves_{model_type}.png'))
-    print(f"\n训练曲线已保存: {os.path.join(output_dir, f'training_curves_{model_type}.png')}")
+    curves_path = os.path.join(output_dir, f'training_curves_{model_type}.png')
+    plt.savefig(curves_path, dpi=100, bbox_inches='tight')
+    plt.close(fig)  # 立即关闭figure，释放资源
+    print(f"\n训练曲线已保存: {curves_path}")
     
     # 最终评估
     print("\n最终评估:")
     val_loss, val_acc, val_preds, val_labels = validate(model, val_loader, criterion, device)
     
     # 分类报告
-    action_names_list = [action_names.get(i, f"class_{i}") for i in range(num_classes)]
+    # 只使用实际存在的类别
+    unique_labels = sorted(set(list(val_labels) + list(val_preds)))
+    action_names_list = [action_names.get(i, f"class_{i}") for i in unique_labels]
+    
     print("\n分类报告:")
-    print(classification_report(val_labels, val_preds, target_names=action_names_list))
+    try:
+        # 使用labels参数指定实际存在的类别
+        print(classification_report(val_labels, val_preds, 
+                                  labels=unique_labels,
+                                  target_names=action_names_list,
+                                  zero_division=0))
+    except Exception as e:
+        print(f"生成分类报告时出错: {e}")
+        # 如果还是出错，使用简化版本
+        print(f"实际类别: {unique_labels}")
+        print(f"预测类别: {sorted(set(val_preds))}")
+        from sklearn.metrics import accuracy_score
+        print(f"准确率: {accuracy_score(val_labels, val_preds):.2%}")
     
     # 混淆矩阵
-    cm = confusion_matrix(val_labels, val_preds)
-    plt.figure(figsize=(8, 6))
+    # 只使用实际存在的类别
+    unique_labels = sorted(set(list(val_labels) + list(val_preds)))
+    cm = confusion_matrix(val_labels, val_preds, labels=unique_labels)
+    action_names_list = [action_names.get(i, f"class_{i}") for i in unique_labels]
+    
+    plt.close('all')  # 确保关闭之前的figure
+    fig = plt.figure(figsize=(8, 6))
     
     if HAS_SEABORN:
         # 使用seaborn绘制（更美观）
@@ -436,7 +565,7 @@ def train_action_classifier(
         plt.yticks(tick_marks, action_names_list)
         
         # 添加数值标注
-        thresh = cm.max() / 2.
+        thresh = cm.max() / 2. if cm.max() > 0 else 0.5
         for i in range(cm.shape[0]):
             for j in range(cm.shape[1]):
                 plt.text(j, i, format(cm[i, j], 'd'),
@@ -447,8 +576,10 @@ def train_action_classifier(
     plt.ylabel('True Label')
     plt.xlabel('Predicted Label')
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'confusion_matrix_{model_type}.png'))
-    print(f"混淆矩阵已保存: {os.path.join(output_dir, f'confusion_matrix_{model_type}.png')}")
+    cm_path = os.path.join(output_dir, f'confusion_matrix_{model_type}.png')
+    plt.savefig(cm_path, dpi=100, bbox_inches='tight')
+    plt.close(fig)  # 立即关闭figure，释放资源
+    print(f"混淆矩阵已保存: {cm_path}")
     
     print(f"\n训练完成! 最佳验证准确率: {best_val_acc:.2f}%")
     print(f"模型保存在: {os.path.join(output_dir, f'best_{model_type}_action_classifier.pth')}")
@@ -459,8 +590,8 @@ def main():
     parser.add_argument('--data', type=str, required=True, 
                        help='标注JSON文件或包含多个JSON文件的目录')
     parser.add_argument('--model_type', type=str, default='lstm', 
-                       choices=['lstm', 'gru', 'transformer'],
-                       help='模型类型')
+                       choices=['lstm', 'gru', 'transformer', 'stgcn'],
+                       help='模型类型 (lstm/gru/transformer/stgcn)')
     parser.add_argument('--seq_len', type=int, default=30, help='序列长度')
     parser.add_argument('--hidden_dim', type=int, default=128, help='隐藏层维度')
     parser.add_argument('--num_layers', type=int, default=2, help='LSTM/GRU层数')
@@ -474,9 +605,15 @@ def main():
     args = parser.parse_args()
     
     # 检查设备
-    if args.device == 'cuda' and not torch.cuda.is_available():
-        print("CUDA不可用，使用CPU")
-        args.device = 'cpu'
+    print(f"检查设备: {args.device}...", flush=True)
+    if args.device == 'cuda':
+        if torch.cuda.is_available():
+            print(f"CUDA可用，使用GPU: {torch.cuda.get_device_name(0)}", flush=True)
+        else:
+            print("CUDA不可用，切换到CPU", flush=True)
+            args.device = 'cpu'
+    else:
+        print(f"使用CPU", flush=True)
     
     train_action_classifier(
         data_dir=args.data,

@@ -145,6 +145,7 @@ python train_action_classifier.py \
 - **LSTM**: 平衡性能和准确率，推荐使用
 - **GRU**: 更轻量，训练更快
 - **Transformer**: 更强大但需要更多数据和计算资源
+- **ST-GCN**: 基于图卷积网络，专门为动作识别设计，能更好地捕捉骨架的空间结构关系，适合动作识别任务
 
 **训练输出：**
 - 最佳模型：`best_{model_type}_action_classifier.pth`
@@ -230,8 +231,9 @@ python infer_action.py \
 
 ### 4. 模型选择
 - **小数据集** (<500样本): 使用GRU
-- **中等数据集** (500-2000样本): 使用LSTM
-- **大数据集** (>2000样本): 可以尝试Transformer
+- **中等数据集** (500-2000样本): 使用LSTM或ST-GCN
+- **大数据集** (>2000样本): 可以尝试Transformer或ST-GCN
+- **动作识别任务**: 推荐使用ST-GCN，因为它专门为骨架动作识别设计
 
 ## 🔧 故障排除
 
@@ -303,8 +305,8 @@ python video_action_labeler.py --video ./videos/walk1.mp4 --output ./action_labe
 python video_action_labeler.py --video ./videos/jump1.mp4 --output ./action_labels/jump1.json
 python video_action_labeler.py --video ./videos/run1.mp4 --output ./action_labels/run1.json
 
-# 3. 训练模型
-python train_action_classifier.py --data ./action_labels/ --model_type lstm --epochs 50
+# 3. 训练模型（支持lstm/gru/transformer/stgcn）
+python train_action_classifier.py --data ./action_labels/ --model_type stgcn --epochs 50
 
 # 4. 测试识别
 python infer_action.py \
@@ -321,6 +323,7 @@ python infer_action.py \
 4. **视频格式**: 支持常见视频格式（mp4, avi等）
 5. **实时标注权限**: 在Linux上运行实时标注工具可能需要sudo权限（用于键盘监听）
 6. **屏幕捕获性能**: 使用`mss`库可以获得更好的屏幕捕获性能，建议安装：`pip install mss`
+7. **ST-GCN使用现有pose数据**: ST-GCN可以使用YOLO提取的pose关键点数据训练，不需要自己提取pose。只需使用标注工具（视频标注或实时标注）提取关键点序列，然后选择`--model_type stgcn`进行训练即可。
 
 ## 🎉 完成！
 
