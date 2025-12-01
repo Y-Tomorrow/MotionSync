@@ -602,11 +602,7 @@
                 
                 <div id="training_progress" style="margin-top: 20px; display: none;">
                     <h3>训练进度</h3>
-                    <div style="margin-bottom: 10px;">
-                        <div>当前轮次: <span id="training_current_epoch">0</span> / <span id="training_total_epochs">0</span></div>
-                        <div class="progress" style="margin-top: 5px;">
-                        <div class="progress-bar" id="training_progress_bar" style="width: 0%;"></div>
-                    </div>
+                    
                 </div>
                     <div id="training_logs" class="log-container" style="height: 300px; margin-top: 10px;">
                         <div style="color: #666; padding: 10px;">等待训练日志...</div>
@@ -1892,6 +1888,15 @@
                     fetch('/api/get_training_status')
                         .then(r => r.json())
                         .then(status => {
+                            // 调试信息
+                            console.log('训练状态:', {
+                                running: status.running,
+                                logs_count: status.logs_count || 0,
+                                current_epoch: status.current_epoch,
+                                total_epochs: status.total_epochs,
+                                has_logs: status.logs && status.logs.length > 0
+                            });
+                            
                             if (status.running) {
                                 // 更新轮次信息
                                 const currentEpochEl = document.getElementById('training_current_epoch');
@@ -1912,22 +1917,11 @@
                                     }
                                 }
                                 
-                                // 更新日志
-                                    const logsDiv = document.getElementById('training_logs');
+                                // 更新日志显示（训练中显示等待信息）
+                                const logsDiv = document.getElementById('training_logs');
                                 if (logsDiv) {
-                                    if (status.logs && status.logs.length > 0) {
-                                        // 显示所有日志
-                                        logsDiv.innerHTML = status.logs.map(log => {
-                                            // 转义HTML特殊字符
-                                            const escaped = String(log).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                                            return `<div>${escaped}</div>`;
-                                        }).join('');
-                                    logsDiv.scrollTop = logsDiv.scrollHeight;
-                                    } else {
-                                        // 如果没有日志，显示等待提示
-                                        if (logsDiv.innerHTML.trim() === '' || logsDiv.innerHTML.includes('等待训练日志')) {
-                                            logsDiv.innerHTML = '<div style="color: #666; padding: 10px;">等待训练日志...</div>';
-                                        }
+                                    if (status.running) {
+                                        logsDiv.innerHTML = '<div style="color: #666; padding: 10px;">训练进行中，请等待训练完成...</div>';
                                     }
                                 }
                             } else {
@@ -1937,8 +1931,9 @@
                                     setTrainingStatus('success', status.message);
                                 }
                                 
-                                // 训练完成后，尝试加载训练结果图片
+                                // 训练完成后，加载训练结果图片和日志
                                 loadTrainingResults(status);
+                                loadTrainingLog(status);
                             }
                         });
                 }, 2000);
@@ -1995,6 +1990,63 @@
                 img.onerror = function() {
                     console.error('加载混淆矩阵失败');
                 };
+            }
+        }
+        
+        function loadTrainingLog(status) {
+            console.log('loadTrainingLog called with status:', status);
+            // 加载训练日志
+            if (status.has_log_file && status.log_file_path) {
+                console.log('Loading log file from:', status.log_file_path);
+                fetch('/api/get_training_log')
+                    .then(r => {
+                        if (!r.ok) {
+                            throw new Error(`HTTP error! status: ${r.status}`);
+                        }
+                        return r.json();
+                    })
+                    .then(data => {
+                        console.log('Log data received, length:', data.log_content ? data.log_content.length : 0);
+                        if (data.error) {
+                            console.error('加载日志失败:', data.error);
+                            const logsDiv = document.getElementById('training_logs');
+                            if (logsDiv) {
+                                logsDiv.innerHTML = '<div style="color: #d32f2f; padding: 10px;">加载日志失败: ' + data.error + '</div>';
+                            }
+                        } else if (data.log_content) {
+                            const logsDiv = document.getElementById('training_logs');
+                            if (logsDiv) {
+                                // 将日志内容按行分割并显示
+                                const lines = data.log_content.split('\n');
+                                logsDiv.innerHTML = lines.map(line => {
+                                    // 转义HTML特殊字符
+                                    const escaped = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                                    return `<div style="padding: 2px 0; font-family: monospace; font-size: 12px; white-space: pre-wrap;">${escaped}</div>`;
+                                }).join('');
+                                logsDiv.scrollTop = logsDiv.scrollHeight;
+                                console.log('Log displayed successfully, lines:', lines.length);
+                            }
+                        } else {
+                            console.warn('No log_content in response');
+                            const logsDiv = document.getElementById('training_logs');
+                            if (logsDiv) {
+                                logsDiv.innerHTML = '<div style="color: #666; padding: 10px;">日志文件为空</div>';
+                            }
+                        }
+                    })
+                    .catch(err => {
+                        console.error('加载日志失败:', err);
+                        const logsDiv = document.getElementById('training_logs');
+                        if (logsDiv) {
+                            logsDiv.innerHTML = '<div style="color: #d32f2f; padding: 10px;">加载日志失败: ' + err + '</div>';
+                        }
+                    });
+            } else {
+                console.log('No log file available. has_log_file:', status.has_log_file, 'log_file_path:', status.log_file_path);
+                const logsDiv = document.getElementById('training_logs');
+                if (logsDiv) {
+                    logsDiv.innerHTML = '<div style="color: #666; padding: 10px;">暂无训练日志 (has_log_file: ' + status.has_log_file + ', log_file_path: ' + (status.log_file_path || 'null') + ')</div>';
+                }
             }
         }
         

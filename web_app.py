@@ -1167,131 +1167,61 @@ def start_action_training():
         if not os.path.exists(data_path):
             return jsonify({'error': '数据路径不存在'}), 400
         
-        # 导入训练函数
+        # 导入训练函数（在worker外部导入，避免在worker内部导入时输出被捕获）
         from train_action_classifier import train_action_classifier
         
         def worker():
+            # 初始化状态
+            action_training_state['running'] = True
+            action_training_state['stop_flag'] = False
+            action_training_state['current_epoch'] = 0
+            action_training_state['total_epochs'] = epochs
+            action_training_state['output_dir'] = output_dir
+            action_training_state['model_type'] = model_type
+            
+            # 创建日志文件路径
+            log_file_path = os.path.join(output_dir, f'training_log_{model_type}.txt')
+            os.makedirs(output_dir, exist_ok=True)
+            # 立即保存日志文件路径到状态，确保前端能获取到
+            action_training_state['log_file'] = log_file_path
+            
             try:
-                action_training_state['running'] = True
-                action_training_state['stop_flag'] = False
-                action_training_state['logs'] = []
-                action_training_state['current_epoch'] = 0
-                action_training_state['total_epochs'] = epochs
-                action_training_state['output_dir'] = output_dir
-                action_training_state['model_type'] = model_type
-                
-                # 重定向日志到状态
+                # 重定向stdout到文件
                 import sys
-                from io import StringIO
-                import builtins
-                
-                class TrainingLogHandler(logging.Handler):
-                    def emit(self, record):
-                        log_entry = self.format(record)
-                        action_training_state['logs'].append(log_entry)
-                        # 保持最近500条日志
-                        if len(action_training_state['logs']) > 500:
-                            action_training_state['logs'] = action_training_state['logs'][-500:]
-                
-                # 捕获print输出和stdout
-                original_print = builtins.print
                 original_stdout = sys.stdout
                 
-                class CapturedStdout:
-                    """捕获stdout输出"""
-                    def __init__(self, original):
+                # 打开日志文件（写入模式）
+                log_file = open(log_file_path, 'w', encoding='utf-8')
+                
+                # 创建一个同时写入文件和原始stdout的类
+                class TeeOutput:
+                    def __init__(self, file, original):
+                        self.file = file
                         self.original = original
-                        self.buffer = ''  # 缓冲区，用于处理不完整的行
                     
                     def write(self, text):
-                        if text:
-                            # 移除ANSI颜色代码
-                            import re
-                            clean_text = re.sub(r'\x1b\[[0-9;]*m', '', text)
-                            
-                            # 将文本添加到缓冲区
-                            self.buffer += clean_text
-                            
-                            # 处理完整的行（以换行符结尾）
-                            while '\n' in self.buffer:
-                                line, self.buffer = self.buffer.split('\n', 1)
-                                line = line.strip()
-                                if line:  # 只添加非空行
-                                    action_training_state['logs'].append(line)
-                                    # 保持最近500条日志（增加容量以便查看完整训练过程）
-                                    if len(action_training_state['logs']) > 500:
-                                        action_training_state['logs'] = action_training_state['logs'][-500:]
-                        
+                        self.file.write(text)
+                        self.file.flush()
                         self.original.write(text)
                         self.original.flush()
                     
                     def flush(self):
-                        # 如果缓冲区有内容，也添加到日志
-                        if self.buffer.strip():
-                            line = self.buffer.strip()
-                            action_training_state['logs'].append(line)
-                            # 保持最近500条日志
-                            if len(action_training_state['logs']) > 500:
-                                action_training_state['logs'] = action_training_state['logs'][-500:]
-                            self.buffer = ''
+                        self.file.flush()
                         self.original.flush()
                     
                     def __getattr__(self, name):
                         return getattr(self.original, name)
                 
-                captured_stdout = CapturedStdout(original_stdout)
-                sys.stdout = captured_stdout
-                
-                def captured_print(*args, **kwargs):
-                    msg = ' '.join(str(arg) for arg in args)
-                    if msg.strip():  # 只添加非空消息
-                        # 移除ANSI颜色代码
-                        import re
-                        clean_msg = re.sub(r'\x1b\[[0-9;]*m', '', msg).strip()
-                        if clean_msg:
-                            action_training_state['logs'].append(clean_msg)
-                            # 保持最近500条日志
-                            if len(action_training_state['logs']) > 500:
-                                action_training_state['logs'] = action_training_state['logs'][-500:]
-                    # 确保立即输出到控制台和日志
-                    # 如果kwargs中已经有flush，先提取出来，避免重复
-                    flush_value = kwargs.pop('flush', True)  # 默认flush=True
-                    original_print(*args, **kwargs, flush=flush_value)
-                    # 也输出到logging
-                    if msg.strip():
-                        logging.info(msg)
-                
-                # 临时替换print函数
-                builtins.print = captured_print
-                
-                # 设置日志处理器，捕获所有日志输出
-                log_handler = TrainingLogHandler()
-                log_handler.setFormatter(logging.Formatter('%(message)s'))
-                
-                # 为根日志记录器添加处理器，确保捕获所有日志
-                root_logger = logging.getLogger()
-                root_logger.addHandler(log_handler)
-                root_logger.setLevel(logging.INFO)
-                
-                # 也为training logger添加
-                training_logger = logging.getLogger('training')
-                training_logger.addHandler(log_handler)
-                training_logger.setLevel(logging.INFO)
-                
-                # 确保train_action_classifier模块的日志也被捕获
-                train_module_logger = logging.getLogger('train_action_classifier')
-                train_module_logger.addHandler(log_handler)
-                train_module_logger.setLevel(logging.INFO)
+                sys.stdout = TeeOutput(log_file, original_stdout)
                 
                 try:
-                    # 测试日志捕获是否工作
-                    print("测试日志捕获...", flush=True)
-                    action_training_state['logs'].append('=' * 60)
-                    action_training_state['logs'].append('开始训练动作分类模型')
-                    action_training_state['logs'].append(f'模型类型: {model_type}')
-                    action_training_state['logs'].append(f'训练轮数: {epochs}')
-                    action_training_state['logs'].append('=' * 60)
-                    print("日志捕获测试完成，开始训练...", flush=True)
+                    print("=" * 60)
+                    print("开始训练动作分类模型")
+                    print(f"模型类型: {model_type}")
+                    print(f"训练轮数: {epochs}")
+                    print(f"数据路径: {data_path}")
+                    print(f"输出目录: {output_dir}")
+                    print("=" * 60)
                     
                     train_action_classifier(
                         data_dir=data_path,
@@ -1306,22 +1236,27 @@ def start_action_training():
                         output_dir=output_dir
                     )
                     
-                    # 训练完成后添加结束信息
-                    action_training_state['logs'].append('=' * 60)
-                    action_training_state['logs'].append('训练完成！')
-                    action_training_state['logs'].append('=' * 60)
+                    print("=" * 60)
+                    print("训练完成！")
+                    print("=" * 60)
+                    
                 except Exception as e:
+                    import traceback
+                    print("=" * 60)
+                    print(f"训练错误: {str(e)}")
+                    print("=" * 60)
+                    print("错误详情:")
+                    traceback.print_exc()
                     logging.error(f'训练错误: {e}', exc_info=True)
-                    action_training_state['logs'].append(f'训练错误: {str(e)}')
-                    print(f'训练错误: {e}', flush=True)
                 finally:
-                    # 恢复原始print函数和stdout
-                    try:
-                        builtins.print = original_print
-                        sys.stdout = original_stdout
-                    except:
-                        pass
+                    # 恢复原始stdout并关闭文件
+                    sys.stdout = original_stdout
+                    log_file.close()
+                    # 确保日志文件路径已保存
+                    action_training_state['log_file'] = log_file_path
+                    logging.info(f'训练日志已保存到: {log_file_path}')
                     action_training_state['running'] = False
+                    
             except Exception as e:
                 logging.error(f'训练线程错误: {e}', exc_info=True)
                 action_training_state['running'] = False
@@ -1330,7 +1265,18 @@ def start_action_training():
         t.start()
         action_training_state['thread'] = t
         
-        return jsonify({'message': '训练已启动'})
+        # 等待一小段时间，确保worker函数开始执行并初始化日志
+        import time
+        time.sleep(0.1)
+        
+        # 检查日志是否已初始化
+        logs_count = len(action_training_state.get('logs', []))
+        logging.info(f'训练线程已启动，当前日志数: {logs_count}')
+        
+        return jsonify({
+            'message': '训练已启动',
+            'initial_logs_count': logs_count
+        })
         
     except Exception as e:
         logging.error(f'启动训练失败: {e}', exc_info=True)
@@ -1357,17 +1303,16 @@ def get_training_status():
     # 检查训练结果图片是否存在
     training_curves_path = os.path.join(output_dir, f'training_curves_{model_type}.png')
     confusion_matrix_path = os.path.join(output_dir, f'confusion_matrix_{model_type}.png')
+    log_file_path = action_training_state.get('log_file', os.path.join(output_dir, f'training_log_{model_type}.txt'))
     
-    # 获取所有日志（不只是最近20条），让用户能看到完整的训练过程
-    all_logs = action_training_state.get('logs', [])
     result = {
-        'running': action_training_state['running'],
+        'running': action_training_state.get('running', False),
         'current_epoch': action_training_state.get('current_epoch', 0),
         'total_epochs': action_training_state.get('total_epochs', 0),
-        'logs': all_logs,  # 返回所有日志，让前端显示完整训练过程
-        'logs_count': len(all_logs),  # 日志总数，用于调试
         'has_training_curves': os.path.exists(training_curves_path),
-        'has_confusion_matrix': os.path.exists(confusion_matrix_path)
+        'has_confusion_matrix': os.path.exists(confusion_matrix_path),
+        'has_log_file': os.path.exists(log_file_path),
+        'log_file_path': log_file_path if os.path.exists(log_file_path) else None
     }
     
     if result['has_training_curves']:
@@ -1376,6 +1321,28 @@ def get_training_status():
         result['confusion_matrix_path'] = confusion_matrix_path
     
     return jsonify(result)
+
+@app.route('/api/get_training_log')
+def get_training_log():
+    """获取训练日志文件内容"""
+    global action_training_state
+    output_dir = action_training_state.get('output_dir', './models/action_classifier')
+    model_type = action_training_state.get('model_type', 'lstm')
+    log_file_path = action_training_state.get('log_file', os.path.join(output_dir, f'training_log_{model_type}.txt'))
+    
+    if not os.path.exists(log_file_path):
+        return jsonify({'error': '日志文件不存在', 'log_file_path': log_file_path}), 404
+    
+    try:
+        with open(log_file_path, 'r', encoding='utf-8') as f:
+            log_content = f.read()
+        return jsonify({
+            'log_content': log_content,
+            'log_file_path': log_file_path
+        })
+    except Exception as e:
+        logging.error(f'读取日志文件失败: {e}', exc_info=True)
+        return jsonify({'error': f'读取日志文件失败: {str(e)}'}), 500
 
 @app.route('/api/get_training_image')
 def get_training_image():
