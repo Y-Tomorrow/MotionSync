@@ -645,6 +645,42 @@
             const tabs = document.querySelectorAll('.tab');
             tabs.forEach(tab => tab.classList.remove('active'));
             
+            // 如果切换到非"模型训练"标签页，确保训练结果图片被隐藏
+            if (tabName !== 'action_training') {
+                const trainingCurvesImg = document.getElementById('training_curves_img');
+                const confusionMatrixImg = document.getElementById('confusion_matrix_img');
+                const trainingResultsDiv = document.getElementById('training_results');
+                if (trainingCurvesImg) {
+                    trainingCurvesImg.style.display = 'none';
+                }
+                if (confusionMatrixImg) {
+                    confusionMatrixImg.style.display = 'none';
+                }
+                if (trainingResultsDiv) {
+                    trainingResultsDiv.style.display = 'none';
+                }
+            } else {
+                // 如果切换到"模型训练"标签页，检查是否有已加载的训练结果
+                const trainingResultsDiv = document.getElementById('training_results');
+                const trainingCurvesImg = document.getElementById('training_curves_img');
+                const confusionMatrixImg = document.getElementById('confusion_matrix_img');
+                
+                // 如果训练结果区域存在且有图片已加载，则显示它们
+                if (trainingResultsDiv && (trainingCurvesImg?.src || confusionMatrixImg?.src)) {
+                    trainingResultsDiv.style.display = 'block';
+                    if (trainingCurvesImg && trainingCurvesImg.src) {
+                        trainingCurvesImg.style.display = 'block';
+                        const placeholder = document.getElementById('training_curves_placeholder');
+                        if (placeholder) placeholder.style.display = 'none';
+                    }
+                    if (confusionMatrixImg && confusionMatrixImg.src) {
+                        confusionMatrixImg.style.display = 'block';
+                        const placeholder = document.getElementById('confusion_matrix_placeholder');
+                        if (placeholder) placeholder.style.display = 'none';
+                    }
+                }
+            }
+            
             // 显示选中的标签页
             document.getElementById(tabName).classList.add('active');
             event.target.classList.add('active');
@@ -1960,9 +1996,18 @@
         }
         
         function loadTrainingResults(status) {
-            // 显示训练结果区域
+            // 检查当前是否在"模型训练"标签页
+            const actionTrainingTab = document.getElementById('action_training');
+            const isActionTrainingActive = actionTrainingTab && actionTrainingTab.classList.contains('active');
+            
+            // 显示训练结果区域（只在"模型训练"标签页中显示）
             const resultsDiv = document.getElementById('training_results');
-            resultsDiv.style.display = 'block';
+            if (isActionTrainingActive) {
+                resultsDiv.style.display = 'block';
+            } else {
+                resultsDiv.style.display = 'none';
+                return; // 如果不在"模型训练"标签页，不加载图片
+            }
             
             // 加载训练曲线
             if (status.has_training_curves && status.training_curves_path) {
@@ -1970,8 +2015,13 @@
                 const placeholder = document.getElementById('training_curves_placeholder');
                 img.src = '/api/get_training_image?path=' + encodeURIComponent(status.training_curves_path);
                 img.onload = function() {
-                    img.style.display = 'block';
-                    if (placeholder) placeholder.style.display = 'none';
+                    // 再次检查是否仍在"模型训练"标签页
+                    const isStillActive = document.getElementById('action_training') && 
+                                         document.getElementById('action_training').classList.contains('active');
+                    if (isStillActive) {
+                        img.style.display = 'block';
+                        if (placeholder) placeholder.style.display = 'none';
+                    }
                 };
                 img.onerror = function() {
                     console.error('加载训练曲线失败');
@@ -1984,8 +2034,13 @@
                 const placeholder = document.getElementById('confusion_matrix_placeholder');
                 img.src = '/api/get_training_image?path=' + encodeURIComponent(status.confusion_matrix_path);
                 img.onload = function() {
-                    img.style.display = 'block';
-                    if (placeholder) placeholder.style.display = 'none';
+                    // 再次检查是否仍在"模型训练"标签页
+                    const isStillActive = document.getElementById('action_training') && 
+                                         document.getElementById('action_training').classList.contains('active');
+                    if (isStillActive) {
+                        img.style.display = 'block';
+                        if (placeholder) placeholder.style.display = 'none';
+                    }
                 };
                 img.onerror = function() {
                     console.error('加载混淆矩阵失败');
