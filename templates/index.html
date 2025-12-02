@@ -356,8 +356,18 @@
                     <small style="color: #666;">1.0=正常速度，2.0=2倍速，0.5=0.5倍速</small>
                 </div>
                 <div class="form-group">
-                    <label>ST-GCN动作识别模型路径 (可选):</label>
-                    <input type="text" id="pose_action_model" placeholder="例如: ./models/action_classifier/stgcn_best.pth">
+                    <label>动作识别模型类型:</label>
+                    <select id="pose_action_model_type" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;" onchange="updateDefaultActionModelPath()">
+                        <option value="stgcn" selected>ST-GCN</option>
+                        <option value="lstm">LSTM</option>
+                        <option value="gru">GRU</option>
+                        <option value="transformer">Transformer</option>
+                    </select>
+                    <small style="color: #666;">选择要使用的动作识别模型类型，会自动填充默认模型路径</small>
+                </div>
+                <div class="form-group">
+                    <label>动作识别模型路径 (可选):</label>
+                    <input type="text" id="pose_action_model" placeholder="例如: ./models/action_classifier/best_stgcn_action_classifier.pth">
                     <small style="color: #666;">留空则仅显示关键点，不进行动作识别</small>
                 </div>
                 <button class="btn" onclick="startPoseStream()">开始</button>
@@ -367,7 +377,7 @@
                 
                 <!-- 动作识别结果显示 -->
                 <div id="pose_action_display" style="margin-top: 15px; padding: 15px; background: #f8f9fa; border-radius: 8px; display: none;">
-                    <h3 style="margin-top: 0;">动作识别结果 (ST-GCN)</h3>
+                    <h3 style="margin-top: 0;">动作识别结果 (<span id="pose_action_model_type_display">-</span>)</h3>
                     <div style="font-size: 18px; font-weight: bold; color: #667eea;">
                         动作: <span id="pose_action_name">-</span>
                     </div>
@@ -556,10 +566,10 @@
                         <div class="form-group">
                             <label>模型类型:</label>
                             <select id="training_model_type">
-                                <option value="lstm" selected>LSTM（推荐）</option>
+                                <option value="stgcn" selected>ST-GCN（图卷积，适合动作识别，推荐）</option>
+                                <option value="lstm">LSTM</option>
                                 <option value="gru">GRU（轻量）</option>
                                 <option value="transformer">Transformer（强大）</option>
-                                <option value="stgcn">ST-GCN（图卷积，适合动作识别）</option>
                             </select>
                         </div>
                         <div class="form-group">
@@ -1115,13 +1125,42 @@
             skeletonLine.geometry.attributes.position.needsUpdate = true;
         }
 
+        function updateDefaultActionModelPath() {
+            const typeSelect = document.getElementById('pose_action_model_type');
+            const pathInput = document.getElementById('pose_action_model');
+            if (!typeSelect || !pathInput) return;
+            
+            const actionModelType = typeSelect.value || 'stgcn';
+            let defaultPath = '';
+            if (actionModelType === 'stgcn') {
+                defaultPath = './models/action_classifier/best_stgcn_action_classifier.pth';
+            } else if (actionModelType === 'lstm') {
+                defaultPath = './models/action_classifier/best_lstm_action_classifier.pth';
+            } else if (actionModelType === 'gru') {
+                defaultPath = './models/action_classifier/best_gru_action_classifier.pth';
+            } else if (actionModelType === 'transformer') {
+                defaultPath = './models/action_classifier/best_transformer_action_classifier.pth';
+            }
+            // 只有在当前输入为空或已经是上一个默认值时才覆盖，避免用户手动改后的值被强行覆盖
+            if (!pathInput.value || pathInput.value.startsWith('./models/action_classifier/best_')) {
+                pathInput.value = defaultPath;
+            }
+            const typeDisplay = document.getElementById('pose_action_model_type_display');
+            if (typeDisplay) {
+                typeDisplay.textContent = (actionModelType || '-').toUpperCase();
+            }
+        }
+        
         function startPoseStream() {
             ensureThree();
             const videoPath = document.getElementById('video_path').value;
             const modelPath = document.getElementById('pose_model_path').value;
             const conf = parseFloat(document.getElementById('pose_conf').value || '0.5');
             const roi = document.getElementById('pose_roi').value.trim() || null;
-            const actionModelPath = document.getElementById('pose_action_model').value.trim() || null;
+            const actionModelType = document.getElementById('pose_action_model_type').value || 'stgcn';
+            // 先根据当前选择更新一次默认路径
+            updateDefaultActionModelPath();
+            let actionModelPath = document.getElementById('pose_action_model').value.trim();
             
             if (!videoPath) {
                 setPoseStatus('error', '请填写视频路径');
@@ -1140,6 +1179,9 @@
             }
             if (actionModelPath) {
                 data.action_model_path = actionModelPath;
+                data.action_model_type = actionModelType;
+                // 更新显示模型类型
+                document.getElementById('pose_action_model_type_display').textContent = actionModelType.toUpperCase();
             }
             
             fetch('/api/start_video_pose', {
@@ -2105,11 +2147,17 @@
             }
         }
         
-        // 页面加载时自动加载数据集信息
+        // 页面加载时自动加载数据集信息，并初始化动作识别默认模型路径
         window.onload = function() {
             loadDatasetInfo();
             loadLogs();
             checkCocoStatus();
+            // 初始化3D火柴人动作识别默认模型路径（默认ST-GCN）
+            try {
+                updateDefaultActionModelPath();
+            } catch (e) {
+                console.warn('初始化动作识别默认路径失败:', e);
+            }
         };
     </script>
 </body>

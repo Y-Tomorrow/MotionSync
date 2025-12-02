@@ -534,7 +534,8 @@ def start_video_pose():
         conf_threshold = float(data.get('conf_threshold', 0.5))
         roi_str = data.get('roi')  # 格式: "x,y,w,h" 或 None
         playback_speed = float(data.get('playback_speed', 1.0))  # 播放速度倍数，1.0=正常速度
-        action_model_path = data.get('action_model_path')  # ST-GCN模型路径（可选）
+        action_model_path = data.get('action_model_path')  # 动作识别模型路径（可选）
+        action_model_type = data.get('action_model_type', 'stgcn')  # 模型类型：lstm, gru, transformer, stgcn
         
         if not video_path or not os.path.exists(video_path):
             return jsonify({'error': '视频文件不存在'}), 400
@@ -568,29 +569,65 @@ def start_video_pose():
                 pose_stream_state['model'] = model
                 logging.info('模型加载完成')
                 
-                # 加载ST-GCN动作识别模型（如果提供）
+                # 加载动作识别模型（如果提供）
                 if action_model_path and os.path.exists(action_model_path):
                     try:
                         import torch
                         from collections import deque
-                        from action_classifier import ActionClassifierSTGCN
+                        from action_classifier import (
+                            ActionClassifier, ActionClassifierGRU, 
+                            ActionClassifierTransformer, ActionClassifierSTGCN
+                        )
                         
-                        logging.info(f'加载ST-GCN动作识别模型: {action_model_path}')
+                        logging.info(f'加载动作识别模型 ({action_model_type}): {action_model_path}')
                         checkpoint = torch.load(action_model_path, map_location='cpu')
                         
-                        # 获取模型参数
-                        num_nodes = checkpoint.get('num_nodes', 17)
-                        in_channels = checkpoint.get('in_channels', 2)
+                        # 从checkpoint获取模型类型（如果存在）
+                        checkpoint_model_type = checkpoint.get('model_type', action_model_type)
                         num_classes = checkpoint.get('num_classes', 6)
                         action_map = checkpoint.get('action_map', {})
                         sequence_length = checkpoint.get('sequence_length', 30)
                         
-                        # 创建模型
-                        action_model = ActionClassifierSTGCN(
-                            num_nodes=num_nodes,
-                            in_channels=in_channels,
-                            num_classes=num_classes
-                        )
+                        # 根据模型类型创建模型
+                        if checkpoint_model_type == 'stgcn':
+                            num_nodes = checkpoint.get('num_nodes', 17)
+                            in_channels = checkpoint.get('in_channels', 2)
+                            action_model = ActionClassifierSTGCN(
+                                num_nodes=num_nodes,
+                                in_channels=in_channels,
+                                num_classes=num_classes
+                            )
+                        elif checkpoint_model_type == 'lstm':
+                            input_dim = checkpoint.get('input_dim', 34)
+                            hidden_dim = checkpoint.get('hidden_dim', 128)
+                            num_layers = checkpoint.get('num_layers', 2)
+                            action_model = ActionClassifier(
+                                input_dim=input_dim,
+                                hidden_dim=hidden_dim,
+                                num_layers=num_layers,
+                                num_classes=num_classes
+                            )
+                        elif checkpoint_model_type == 'gru':
+                            input_dim = checkpoint.get('input_dim', 34)
+                            hidden_dim = checkpoint.get('hidden_dim', 128)
+                            num_layers = checkpoint.get('num_layers', 2)
+                            action_model = ActionClassifierGRU(
+                                input_dim=input_dim,
+                                hidden_dim=hidden_dim,
+                                num_layers=num_layers,
+                                num_classes=num_classes
+                            )
+                        elif checkpoint_model_type == 'transformer':
+                            input_dim = checkpoint.get('input_dim', 34)
+                            d_model = checkpoint.get('hidden_dim', 128)
+                            action_model = ActionClassifierTransformer(
+                                input_dim=input_dim,
+                                d_model=d_model,
+                                num_classes=num_classes
+                            )
+                        else:
+                            raise ValueError(f"不支持的模型类型: {checkpoint_model_type}")
+                        
                         action_model.load_state_dict(checkpoint['model_state_dict'])
                         action_model.eval()
                         
@@ -603,12 +640,16 @@ def start_video_pose():
                         keypoint_buffer = deque(maxlen=sequence_length)
                         
                         pose_stream_state['action_model'] = action_model
-                        logging.info(f'ST-GCN模型加载完成，序列长度: {sequence_length}')
+                        pose_stream_state['action_model_type'] = checkpoint_model_type
+                        logging.info(f'{checkpoint_model_type.upper()}模型加载完成，序列长度: {sequence_length}')
                     except Exception as e:
-                        logging.warning(f'加载ST-GCN模型失败: {e}，将仅进行关键点检测')
+                        logging.warning(f'加载动作识别模型失败: {e}，将仅进行关键点检测')
                         action_model = None
+                        keypoint_buffer = None
                 else:
-                    logging.info('未提供ST-GCN模型路径，将仅进行关键点检测')
+                    logging.info('未提供动作识别模型路径，将仅进行关键点检测')
+                    action_model = None
+                    keypoint_buffer = None
                 
                 logging.info('开始读取视频')
                 
@@ -677,9 +718,11 @@ def start_video_pose():
                         bbox_center = np.array([(x_min + x_max) / 2.0, (y_min + y_max) / 2.0])
                         center_ema = (1.0 - alpha) * center_ema + alpha * bbox_center
                     
-                    # ST-GCN动作识别
+                    # 动作识别
                     current_action = None
                     action_confidence = 0.0
+                    model_type = pose_stream_state.get('action_model_type', 'stgcn')
+                    
                     if action_model is not None and best_kp:
                         try:
                             import torch
@@ -688,12 +731,17 @@ def start_video_pose():
                             # 添加到缓冲区
                             keypoint_buffer.append(kp_array.flatten())  # (34,)
                             
-                            # 当缓冲区满时进行推理
-                            if len(keypoint_buffer) == sequence_length:
-                                # 准备输入: (1, time, nodes, channels)
+                            # 当缓冲区满时进行推理（每次缓冲区满时都推理，实现实时更新）
+                            if len(keypoint_buffer) >= sequence_length:
                                 seq_array = np.array(list(keypoint_buffer), dtype=np.float32)  # (seq_len, 34)
-                                seq_array = seq_array.reshape(1, sequence_length, 17, 2)  # (1, seq_len, 17, 2)
-                                seq_tensor = torch.FloatTensor(seq_array)
+                                
+                                # 根据模型类型准备不同的输入格式
+                                if model_type == 'stgcn':
+                                    # ST-GCN需要 (1, seq_len, 17, 2) 格式
+                                    seq_tensor = torch.FloatTensor(seq_array.reshape(1, sequence_length, 17, 2))
+                                else:
+                                    # LSTM/GRU/Transformer需要 (1, seq_len, 34) 格式
+                                    seq_tensor = torch.FloatTensor(seq_array.reshape(1, sequence_length, 34))
                                 
                                 # 推理
                                 with torch.no_grad():
@@ -705,12 +753,34 @@ def start_video_pose():
                                     action_confidence = confidence.item()
                                     current_action = action_names.get(action_id, f"class_{action_id}")
                         except Exception as e:
-                            logging.warning(f'ST-GCN推理失败: {e}')
+                            logging.warning(f'{model_type.upper()}推理失败: {e}')
                             current_action = None
                     elif action_model is not None and not best_kp and keypoint_buffer:
                         # 如果没有检测到关键点，使用上一帧填充
                         if len(keypoint_buffer) > 0:
                             keypoint_buffer.append(keypoint_buffer[-1])
+                            # 如果缓冲区已满，也进行推理（使用重复的关键点）
+                            if len(keypoint_buffer) >= sequence_length:
+                                try:
+                                    import torch
+                                    seq_array = np.array(list(keypoint_buffer), dtype=np.float32)
+                                    
+                                    if model_type == 'stgcn':
+                                        seq_tensor = torch.FloatTensor(seq_array.reshape(1, sequence_length, 17, 2))
+                                    else:
+                                        seq_tensor = torch.FloatTensor(seq_array.reshape(1, sequence_length, 34))
+                                    
+                                    with torch.no_grad():
+                                        outputs = action_model(seq_tensor)
+                                        probs = torch.softmax(outputs, dim=1)
+                                        confidence, predicted = torch.max(probs, 1)
+                                        
+                                        action_id = predicted.item()
+                                        action_confidence = confidence.item()
+                                        current_action = action_names.get(action_id, f"class_{action_id}")
+                                except Exception as e:
+                                    logging.warning(f'{model_type.upper()}推理失败: {e}')
+                                    current_action = None
                     
                     # 每帧都发送视频帧，通过降低质量和适度缩放来平衡性能
                     frame_base64 = None
@@ -768,9 +838,13 @@ def start_video_pose():
                     }
                     
                     # 添加动作识别结果
-                    if current_action is not None:
-                        payload['action'] = current_action
-                        payload['action_confidence'] = float(action_confidence)
+                    # 每次帧都发送动作识别结果（如果缓冲区已满）
+                    if action_model is not None and keypoint_buffer and len(keypoint_buffer) >= sequence_length:
+                        if current_action is not None:
+                            payload['action'] = current_action
+                            payload['action_confidence'] = float(action_confidence)
+                        # 即使current_action为None，也发送一个标记，表示缓冲区已满但当前帧没有结果
+                        # 这样前端可以知道系统正在运行
                     
                     try:
                         q.put(payload, timeout=0.5)
@@ -1152,7 +1226,8 @@ def start_action_training():
     try:
         data = request.json or {}
         data_path = data.get('data_path')
-        model_type = data.get('model_type', 'lstm')
+        # 默认使用ST-GCN作为训练模型类型
+        model_type = data.get('model_type', 'stgcn')
         seq_len = int(data.get('seq_len', 30))
         hidden_dim = int(data.get('hidden_dim', 128))
         num_layers = int(data.get('num_layers', 2))
