@@ -372,6 +372,8 @@
                 </div>
                 <button class="btn" onclick="startPoseStream()">开始</button>
                 <button class="btn" onclick="stopPoseStream()">停止</button>
+                <button class="btn" style="margin-left: 8px; background:#f0ad4e;" onclick="startOverlay()">启动悬浮窗复刻</button>
+                <button class="btn" style="margin-left: 4px; background:#888;" onclick="stopOverlay()">停止悬浮窗</button>
 
                 <div id="pose_status" style="margin-top: 10px;"></div>
                 
@@ -389,9 +391,15 @@
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 15px;">
                     <div>
                         <h3>视频流</h3>
-                        <img id="video_frame" style="width: 100%; background: #111; border-radius: 8px; display: none;">
-                        <div id="video_placeholder" style="width: 100%; height: 360px; background: #111; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #666;">
-                            等待视频流...
+                        <div style="position: relative;">
+                            <img id="video_frame" style="width: 100%; background: #111; border-radius: 8px; display: none;">
+                            <div id="video_placeholder" style="width: 100%; height: 360px; background: #111; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #666;">
+                                等待视频流...
+                            </div>
+                            <div id="pose_key_overlay" style="position: absolute; top: 10px; right: 10px; min-width: 140px; padding: 10px 12px; border-radius: 8px; background: rgba(0,0,0,0.55); color: #fff; font-size: 14px; display: none; box-shadow: 0 2px 8px rgba(0,0,0,0.25);">
+                                <div style="font-weight: 600;">动作: <span id="pose_key_overlay_action">-</span></div>
+                                <div style="margin-top: 4px; font-size: 12px; color: #ddd;">置信度: <span id="pose_key_overlay_conf">0.00</span></div>
+                            </div>
                         </div>
                     </div>
                     <div>
@@ -1223,7 +1231,7 @@
                                 if (placeholder) placeholder.style.display = 'none';
                             }
                             
-                            // 显示动作识别结果
+                // 显示动作识别结果
                             if (data.action !== undefined) {
                                 const actionDisplay = document.getElementById('pose_action_display');
                                 const actionName = document.getElementById('pose_action_name');
@@ -1231,11 +1239,13 @@
                                 
                                 actionDisplay.style.display = 'block';
                                 actionName.textContent = data.action;
-                                actionConf.textContent = (data.action_confidence || 0).toFixed(2);
+                    actionConf.textContent = (data.action_confidence || 0).toFixed(2);
+                    updatePoseOverlay(data.action, data.action_confidence || 0);
                             } else {
                                 // 如果没有动作识别结果，隐藏显示区域
                                 const actionDisplay = document.getElementById('pose_action_display');
                                 actionDisplay.style.display = 'none';
+                    updatePoseOverlay(null, 0);
                             }
                         } else if (data.type === 'error') {
                             setPoseStatus('error', data.message);
@@ -1244,6 +1254,20 @@
                         console.error('解析关键点数据失败:', e);
                     }
                 };
+
+    function updatePoseOverlay(action, conf) {
+        const overlay = document.getElementById('pose_key_overlay');
+        if (!overlay) return;
+        const actEl = document.getElementById('pose_key_overlay_action');
+        const confEl = document.getElementById('pose_key_overlay_conf');
+        if (action !== undefined && action !== null) {
+            overlay.style.display = 'block';
+            actEl.textContent = action;
+            confEl.textContent = (conf || 0).toFixed(2);
+        } else {
+            overlay.style.display = 'none';
+        }
+    }
                 
                 poseEventSource.addEventListener('end', () => {
                     setPoseStatus('success', '视频已结束');
@@ -1268,6 +1292,34 @@
                 .then(r => r.json())
                 .then(res => setPoseStatus('info', res.message || '已停止'))
                 .catch(() => setPoseStatus('error', '停止失败'));
+        }
+
+        function startOverlay() {
+            const videoPath = document.getElementById('video_path').value.trim();
+            const poseModel = document.getElementById('pose_model_path').value.trim();
+            const actionModel = document.getElementById('pose_action_model').value.trim();
+            const speed = parseFloat(document.getElementById('pose_speed').value || '1.0');
+            const payload = {
+                video_path: videoPath || "0",
+                pose_model_path: poseModel || "./models/yolov8n-pose.pt",
+                action_model_path: actionModel || "./models/action_classifier/best_stgcn_action_classifier.pth",
+                preview: true,
+                playback_speed: speed
+            };
+            fetch('/api/start_overlay', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)})
+                .then(r => r.json())
+                .then(res => {
+                    if (res.error) setPoseStatus('error', res.error);
+                    else setPoseStatus('info', res.message || '悬浮窗已启动');
+                })
+                .catch(err => setPoseStatus('error', '启动悬浮窗失败: ' + err));
+        }
+
+        function stopOverlay() {
+            fetch('/api/stop_overlay', { method: 'POST', headers: { 'Content-Type': 'application/json' }})
+                .then(r => r.json())
+                .then(res => setPoseStatus('info', res.message || '悬浮窗已停止'))
+                .catch(err => setPoseStatus('error', '停止悬浮窗失败: ' + err));
         }
 
         function setPoseStatus(type, msg) {

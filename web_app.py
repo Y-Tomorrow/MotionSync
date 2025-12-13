@@ -19,6 +19,13 @@ from flask import Flask, render_template, request, jsonify, send_file, Response,
 import threading
 import base64
 
+# 可选的键盘控制（用于动作→按键复刻）
+try:
+    from pynput import keyboard
+    PYNPUT_AVAILABLE = True
+except Exception:
+    PYNPUT_AVAILABLE = False
+
 # 导入现有功能模块
 from auto_label import auto_label_yolo_format
 from txt_coco_json import txt_to_coco, coco_to_txt
@@ -47,7 +54,8 @@ pose_stream_state = {
     'thread': None,
     'queue': None,
     'model': None,
-    'action_model': None
+    'action_model': None,
+    'key_actuator': None
 }
 
 # 动作标注状态
@@ -64,6 +72,9 @@ action_labeling_state = {
         'output_path': None
     }
 }
+
+# 悬浮窗进程状态
+overlay_process = None
 
 def setup_logging():
     """设置日志"""
@@ -94,6 +105,58 @@ logging.getLogger().addHandler(web_handler)
 def index():
     """主页"""
     return render_template('index.html')
+
+
+@app.route('/api/start_overlay', methods=['POST'])
+def start_overlay():
+    """启动悬浮窗（动作复刻）"""
+    global overlay_process
+    try:
+        data = request.json or {}
+        if overlay_process and overlay_process.poll() is None:
+            return jsonify({'message': '悬浮窗已在运行'}), 200
+        script_path = Path(__file__).parent / 'overlay_action_to_keys.py'
+        if not script_path.exists():
+            return jsonify({'error': '找不到悬浮窗脚本 overlay_action_to_keys.py'}), 400
+        
+        args = [sys.executable, str(script_path)]
+        # 传递默认参数（若前端提供）
+        source = data.get('video_path')
+        pose_model = data.get('pose_model_path')
+        action_model = data.get('action_model_path')
+        preview = data.get('preview', True)
+        playback_speed = data.get('playback_speed', 1.0)
+        if source:
+            args += ['--source', str(source)]
+        if pose_model:
+            args += ['--pose_model', str(pose_model)]
+        if action_model:
+            args += ['--action_model', str(action_model)]
+        if preview:
+            args.append('--preview')
+        if playback_speed:
+            args += ['--speed', str(playback_speed)]
+        overlay_process = subprocess.Popen(args)
+        return jsonify({'message': '悬浮窗已启动'})
+    except Exception as e:
+        logging.exception('启动悬浮窗失败')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/stop_overlay', methods=['POST'])
+def stop_overlay():
+    """停止悬浮窗"""
+    global overlay_process
+    try:
+        if overlay_process and overlay_process.poll() is None:
+            overlay_process.terminate()
+            overlay_process = None
+            return jsonify({'message': '悬浮窗已停止'})
+        overlay_process = None
+        return jsonify({'message': '悬浮窗未运行'})
+    except Exception as e:
+        logging.exception('停止悬浮窗失败')
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/dataset_info')
 def dataset_info():
@@ -457,6 +520,78 @@ def select_best_keypoints(result):
         })
     return kp_list
 
+
+# ===== 动作 → 按键复刻 =====
+def normalize_action_to_key(action_name: str | None):
+    """根据动作名称推断按键（W/A/S/D/空格），其余返回None。"""
+    if not action_name:
+        return None
+    name = str(action_name).lower()
+    if 'w' in name:
+        return 'w'
+    if 'a' in name:
+        return 'a'
+    if 's' in name and 'space' not in name:
+        return 's'
+    if 'd' in name:
+        return 'd'
+    if '空' in name or 'space' in name or 'jump' in name:
+        return 'space'
+    if 'idle' in name or '静' in name:
+        return 'idle'
+    return None
+
+
+class KeyActuator:
+    """使用pynput将动作映射为按键。"""
+    
+    def __init__(self, jump_hold=0.08, jump_interval=0.35):
+        if not PYNPUT_AVAILABLE:
+            raise ImportError("pynput 未安装，无法进行按键复刻。请运行: pip install pynput")
+        self.controller = keyboard.Controller()
+        self.pressed = set()
+        self.jump_hold = jump_hold
+        self.jump_interval = jump_interval
+        self._last_jump = 0.0
+    
+    def release_all(self):
+        for k in list(self.pressed):
+            try:
+                self.controller.release(k)
+            except Exception:
+                pass
+        self.pressed.clear()
+    
+    def apply(self, action_name: str | None):
+        key = normalize_action_to_key(action_name)
+        if key is None or key == 'idle':
+            self.release_all()
+            return
+        
+        # 空格：短按+节流
+        if key == 'space':
+            now = time.time()
+            if now - self._last_jump >= self.jump_interval:
+                self.release_all()
+                try:
+                    self.controller.press(keyboard.Key.space)
+                    time.sleep(self.jump_hold)
+                    self.controller.release(keyboard.Key.space)
+                except Exception:
+                    pass
+                self._last_jump = now
+            return
+        
+        # W/A/S/D 长按保持
+        if self.pressed == {key}:
+            return
+        self.release_all()
+        try:
+            self.controller.press(key)
+            self.pressed = {key}
+        except Exception:
+            self.pressed.clear()
+
 @app.route('/api/get_file')
 def get_file():
     """获取文件内容（用于JSON或视频文件）"""
@@ -536,11 +671,20 @@ def start_video_pose():
         playback_speed = float(data.get('playback_speed', 1.0))  # 播放速度倍数，1.0=正常速度
         action_model_path = data.get('action_model_path')  # 动作识别模型路径（可选）
         action_model_type = data.get('action_model_type', 'stgcn')  # 模型类型：lstm, gru, transformer, stgcn
+        emit_keys = bool(data.get('emit_keys', False))  # 是否复刻为实际按键
+        jump_hold = float(data.get('jump_hold', 0.08))
+        jump_interval = float(data.get('jump_interval', 0.35))
         
         if not video_path or not os.path.exists(video_path):
             return jsonify({'error': '视频文件不存在'}), 400
         if not os.path.exists(model_path):
             return jsonify({'error': '模型文件不存在'}), 400
+        if emit_keys and not PYNPUT_AVAILABLE:
+            return jsonify({'error': '需要安装pynput才能复刻按键: pip install pynput'}), 400
+        if emit_keys and not action_model_path:
+            return jsonify({'error': '开启动作复刻需提供动作识别模型路径'}), 400
+        if emit_keys and action_model_path and not os.path.exists(action_model_path):
+            return jsonify({'error': '动作识别模型不存在，无法复刻按键'}), 400
         
         # 解析ROI
         roi = None
@@ -562,12 +706,22 @@ def start_video_pose():
             keypoint_buffer = None
             action_names = None
             sequence_length = 30
+            actuator = None
             
             try:
                 logging.info('加载YOLO姿态模型中...')
                 model = YOLO(model_path)
                 pose_stream_state['model'] = model
                 logging.info('模型加载完成')
+                
+                if emit_keys:
+                    try:
+                        actuator = KeyActuator(jump_hold=jump_hold, jump_interval=jump_interval)
+                        pose_stream_state['key_actuator'] = actuator
+                        logging.info('按键复刻已启用')
+                    except Exception as e:
+                        logging.warning(f'按键复刻初始化失败: {e}')
+                        actuator = None
                 
                 # 加载动作识别模型（如果提供）
                 if action_model_path and os.path.exists(action_model_path):
@@ -752,6 +906,8 @@ def start_video_pose():
                                     action_id = predicted.item()
                                     action_confidence = confidence.item()
                                     current_action = action_names.get(action_id, f"class_{action_id}")
+                                    if actuator:
+                                        actuator.apply(current_action)
                         except Exception as e:
                             logging.warning(f'{model_type.upper()}推理失败: {e}')
                             current_action = None
@@ -778,9 +934,14 @@ def start_video_pose():
                                         action_id = predicted.item()
                                         action_confidence = confidence.item()
                                         current_action = action_names.get(action_id, f"class_{action_id}")
+                                        if actuator:
+                                            actuator.apply(current_action)
                                 except Exception as e:
                                     logging.warning(f'{model_type.upper()}推理失败: {e}')
                                     current_action = None
+                    elif actuator:
+                        # 无动作结果时释放
+                        actuator.apply('idle')
                     
                     # 每帧都发送视频帧，通过降低质量和适度缩放来平衡性能
                     frame_base64 = None
@@ -880,6 +1041,12 @@ def start_video_pose():
                 pose_stream_state['running'] = False
                 pose_stream_state['model'] = None
                 pose_stream_state['action_model'] = None
+                if pose_stream_state.get('key_actuator'):
+                    try:
+                        pose_stream_state['key_actuator'].release_all()
+                    except Exception:
+                        pass
+                pose_stream_state['key_actuator'] = None
                 try:
                     q.put({'type': 'eof'})
                 except Exception:
