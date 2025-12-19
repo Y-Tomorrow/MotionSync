@@ -333,3 +333,24 @@ if __name__ == '__main__':
     main()
 
 
+'''
+YOLO模型识别
+    ↓
+select_best_keypoints()  ← 提取归一化关键点
+    ↓
+坐标转换（ROI→全局，如果有ROI）
+    ↓
+best_kp (归一化坐标，17个点，每个点2维)
+    ↓
+    ├─→ 计算包围框中心 → EMA平滑 → center_ema
+    │
+    ├─→ 转换为像素坐标 → cv2.circle/cv2.line (2D绘制)
+    │
+    └─→ map_2d_to_3d_centered(best_kp, center_ema, scale)  ← 核心函数
+            ↓
+        pts3d (3D坐标，17个点，每个点3维)
+            ↓
+        line_set.points = pts3d
+            ↓
+        vis.update_geometry() → 3D火柴人渲染
+'''
