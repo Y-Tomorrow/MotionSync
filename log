@@ -50,3 +50,15 @@ day10
 day11
 将识别动作结果转为键盘响应
 
+
+层级	   技术	                      用途
+后端框架	Flask	                  Web 服务器、路由、API
+并发处理	threading	              后台任务执行
+通信机制	queue.Queue	              线程间数据传递
+实时推送	SSE (Server-Sent Events)  关键点数据流式传输
+图像处理	OpenCV (cv2)	          视频帧处理、编码
+深度学习	Ultralytics YOLO	      姿态估计
+3D 渲染	   Three.js	                 浏览器端 3D 火柴人
+前端通信	EventSource API	          接收 SSE 数据流
+图形绘制	Canvas API	              ROI 选择、关键点绘制
+进程管理	subprocess	              启动外部脚本
